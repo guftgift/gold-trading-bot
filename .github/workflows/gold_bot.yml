@@ -1,0 +1,60 @@
+name: 🥇 Gold Trading Bot
+
+on:
+  # ─── รันอัตโนมัติตามตาราง (UTC time) ───────────────────────────────
+  # ตลาดไทย/ลอนดอน/นิวยอร์ก — รัน 4 รอบต่อวัน วันจันทร์-ศุกร์
+  # UTC+7 (ไทย) ดังนั้น UTC 02:00 = 09:00 น. ไทย
+  schedule:
+    - cron: '0 2  * * 1-5'   # 09:00 น. ไทย (เปิดตลาดเช้า)
+    - cron: '0 5  * * 1-5'   # 12:00 น. ไทย (กลางวัน)
+    - cron: '0 9  * * 1-5'   # 16:00 น. ไทย (บ่าย)
+    - cron: '0 13 * * 1-5'   # 20:00 น. ไทย (ตลาดนิวยอร์กเปิด)
+
+  # ─── รันมือได้ทันที (กดปุ่มใน GitHub Actions) ─────────────────────
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry Run (ไม่ส่ง Telegram จริง)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  run-gold-bot:
+    name: Run Gold Trading Signal Bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # 1. Checkout โค้ด
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. ติดตั้ง Python
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # 3. ติดตั้ง dependencies
+      - name: 📦 Install dependencies
+        run: pip install -r requirements.txt
+
+      # 4. รัน Bot
+      - name: 🤖 Run Gold Trading Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
+        run: python gold_trading_bot.py
+
+      # 5. แสดง log ถ้า fail
+      - name: 📋 Show error log (on failure)
+        if: failure()
+        run: |
+          echo "❌ Bot run failed — check logs above"
+          echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S UTC')"
