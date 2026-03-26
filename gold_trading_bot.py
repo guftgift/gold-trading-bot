@@ -434,53 +434,90 @@ def send_telegram(message: str):
         return False
 
 
-def calc_trade_levels(price, signal, atr, ma200):
-    """คำนวณจุดซื้อ / เป้าหมาย / Stop Loss อัตโนมัติจากราคาและ ATR"""
-    buf = atr * 0.5   # buffer ครึ่ง ATR
+def calc_confidence(ma_signal, sentiment, rsi):
+    """คำนวณ Confidence Score 0-100 จาก 3 ปัจจัย"""
+    # MA Score (0-40 คะแนน)
+    ma_score = {
+        "BUY": 40, "STRONG_BUY": 40,
+        "ACCUMULATE": 30, "HOLD_BULLISH": 25,
+        "HOLD": 15, "CAUTION": 10,
+        "WEAK_BUY": 20, "WEAK_SELL": 20,
+        "SELL": 5, "STRONG_SELL": 0,
+        "STAY_OUT": 0, "HOLD_BEARISH": 5,
+    }.get(ma_signal, 15)
+
+    # Sentiment Score (0-40 คะแนน)
+    sent_score = min(40, max(0, int((sentiment['score'] + 1) / 2 * 40)))
+
+    # RSI Score (0-20 คะแนน) — ดีสุดตรงกลาง 40-60
+    if 40 <= rsi <= 60:
+        rsi_score = 20
+    elif 30 <= rsi < 40 or 60 < rsi <= 70:
+        rsi_score = 14
+    elif rsi < 30:
+        rsi_score = 18   # oversold = โอกาสซื้อดี
+    else:
+        rsi_score = 8    # overbought
+
+    total = ma_score + sent_score + rsi_score
+    return min(99, total)   # cap 99 — ไม่มี 100% แน่นอน
+
+
+def calc_trade_levels_thb(price_usd, signal, atr_usd, ma200_usd, usd_thb):
+    """คำนวณจุดซื้อ/ขาย/SL/TP เป็นเงินบาท"""
+    def to_thb(usd_val):
+        """แปลง XAU/USD price → ราคาทองไทย บาท/บาทน้ำหนัก"""
+        TROY_OZ_TO_GRAM = 31.1035
+        THAI_BAHT_GOLD  = 15.244
+        return round((usd_val / TROY_OZ_TO_GRAM) * usd_thb * THAI_BAHT_GOLD * 0.965, -2)
+
+    buf  = atr_usd * 0.5
+    atr2 = atr_usd * 2
+    atr4 = atr_usd * 4
+    atr15 = atr_usd * 1.5
 
     if signal in ("STRONG_BUY", "BUY", "WEAK_BUY", "ACCUMULATE"):
-        entry      = round(price, 2)
-        entry_low  = round(price - buf, 2)          # zone ต่ำสุดที่ยังซื้อได้
-        target1    = round(price + atr * 2, 2)       # +2 ATR
-        target2    = round(price + atr * 4, 2)       # +4 ATR
-        stop_loss  = round(max(price - atr * 1.5, ma200 * 0.995), 2)
-        rr         = round((target1 - entry) / max(entry - stop_loss, 0.01), 1)
+        entry     = price_usd
+        entry_low = price_usd - buf
+        t1        = price_usd + atr2
+        t2        = price_usd + atr4
+        sl        = max(price_usd - atr15, ma200_usd * 0.995)
+        rr        = round((t1 - entry) / max(entry - sl, 0.01), 1)
         return {
-            'action':     "ซื้อ / BUY",
-            'entry':      f"${entry_low:,.2f} – ${entry:,.2f}",
-            'target1':    f"${target1:,.2f}",
-            'target2':    f"${target2:,.2f}",
-            'stop_loss':  f"${stop_loss:,.2f}",
-            'rr':         f"1 : {rr}",
-            'gain1_pct':  round((target1 - price) / price * 100, 2),
-            'gain2_pct':  round((target2 - price) / price * 100, 2),
-            'risk_pct':   round((price - stop_loss) / price * 100, 2),
+            'action':   "🟢 ซื้อ",
+            'entry':    f"฿{to_thb(entry_low):,.0f} – ฿{to_thb(entry):,.0f}",
+            'target1':  f"฿{to_thb(t1):,.0f}",
+            'target2':  f"฿{to_thb(t2):,.0f}",
+            'stop':     f"฿{to_thb(sl):,.0f}",
+            'gain1':    round((t1 - entry) / entry * 100, 1),
+            'gain2':    round((t2 - entry) / entry * 100, 1),
+            'risk':     round((entry - sl)  / entry * 100, 1),
+            'rr':       f"1:{rr}",
         }
     elif signal in ("STRONG_SELL", "SELL", "WEAK_SELL"):
-        entry      = round(price, 2)
-        entry_high = round(price + buf, 2)
-        target1    = round(price - atr * 2, 2)
-        target2    = round(price - atr * 4, 2)
-        stop_loss  = round(price + atr * 1.5, 2)
-        rr         = round((entry - target1) / max(stop_loss - entry, 0.01), 1)
+        entry     = price_usd
+        entry_hi  = price_usd + buf
+        t1        = price_usd - atr2
+        t2        = price_usd - atr4
+        sl        = price_usd + atr15
+        rr        = round((entry - t1) / max(sl - entry, 0.01), 1)
         return {
-            'action':     "ขาย / SELL",
-            'entry':      f"${entry:,.2f} – ${entry_high:,.2f}",
-            'target1':    f"${target1:,.2f}",
-            'target2':    f"${target2:,.2f}",
-            'stop_loss':  f"${stop_loss:,.2f}",
-            'rr':         f"1 : {rr}",
-            'gain1_pct':  round((price - target1) / price * 100, 2),
-            'gain2_pct':  round((price - target2) / price * 100, 2),
-            'risk_pct':   round((stop_loss - price) / price * 100, 2),
+            'action':   "🔴 ขาย",
+            'entry':    f"฿{to_thb(entry):,.0f} – ฿{to_thb(entry_hi):,.0f}",
+            'target1':  f"฿{to_thb(t1):,.0f}",
+            'target2':  f"฿{to_thb(t2):,.0f}",
+            'stop':     f"฿{to_thb(sl):,.0f}",
+            'gain1':    round((entry - t1) / entry * 100, 1),
+            'gain2':    round((entry - t2) / entry * 100, 1),
+            'risk':     round((sl - entry) / entry * 100, 1),
+            'rr':       f"1:{rr}",
         }
-    else:
-        return None
+    return None
 
 
 def build_telegram_message(df, ma_signal, ma_reason,
                             sentiment, final_signal, final_reason):
-    """สร้างข้อความ Telegram พร้อมราคาบาทและจุดซื้อขายที่ชัดเจน"""
+    """สร้างข้อความ Telegram สั้น กระชับ พร้อมราคาบาทและ confidence score"""
     latest    = df.iloc[-1]
     now       = datetime.now().strftime("%d/%m/%Y %H:%M")
     price_usd = float(latest['Close'])
@@ -488,9 +525,16 @@ def build_telegram_message(df, ma_signal, ma_reason,
     atr14     = float((df['High'] - df['Low']).rolling(14).mean().iloc[-1])
     ma200     = float(latest['MA200'])
 
-    # อัตราแลกเปลี่ยนและราคาบาท
+    # ราคาบาท + อัตราแลกเปลี่ยน
     usd_thb   = get_usd_thb()
     thb_price = usd_to_thb_gold(price_usd, usd_thb)
+
+    # Confidence Score
+    confidence = calc_confidence(final_signal, sentiment, rsi)
+    conf_bar   = "█" * (confidence // 10) + "░" * (10 - confidence // 10)
+    conf_label = ("สูงมาก" if confidence >= 80 else
+                  "ดี"     if confidence >= 60 else
+                  "ปานกลาง" if confidence >= 40 else "ต่ำ")
 
     # Signal emoji
     emoji_map = {
@@ -501,69 +545,52 @@ def build_telegram_message(df, ma_signal, ma_reason,
     }
     sig_emoji = emoji_map.get(final_signal, "❓")
 
-    # Sentiment bar
-    total    = max(sentiment['total'], 1)
-    bull_pct = int(sentiment['bullish'] / total * 10)
-    bear_pct = int(sentiment['bearish'] / total * 10)
-    sent_bar = "🟢" * bull_pct + "🔴" * bear_pct + "⚪" * (10 - bull_pct - bear_pct)
+    # Sentiment สรุปสั้น
+    total     = max(sentiment['total'], 1)
+    bull_pct  = round(sentiment['bullish'] / total * 100)
+    bear_pct  = round(sentiment['bearish'] / total * 100)
+    sent_icon = "🟢" if sentiment['label'] == "BULLISH" else ("🔴" if sentiment['label'] == "BEARISH" else "⚪")
+    # หัวข้อข่าวสำคัญ สั้นๆ ไม่เกิน 3 หัวข้อ
+    news_lines = ""
+    for n in sentiment['top_news'][:3]:
+        icon = "▲" if "Bullish" in n['sentiment_label'] else "▼"
+        news_lines += f"\n  {icon} {n['title'][:55]}…"
 
-    # Top news (3 ข่าว)
-    news_text = ""
-    for i, n in enumerate(sentiment['top_news'][:3], 1):
-        t = n['time'].strftime("%H:%M") if n['time'] else "?"
-        news_text += f"\n  {i}. {n['sentiment_label']} {n['title'][:65]}..."
-        news_text += f"\n     📰 {n['source']} ({t})"
-
-    # จุดซื้อขาย
-    levels = calc_trade_levels(price_usd, final_signal, atr14, ma200)
+    # จุดซื้อขายเป็นบาท
+    levels = calc_trade_levels_thb(price_usd, final_signal, atr14, ma200, usd_thb)
 
     if levels:
-        trade_block = f"""
-━━━━━━━━━━━━━━━━━━━━━━
-{sig_emoji} <b>ACTION: {levels['action']}</b>
-
-📌 <b>จุดเข้า</b>   : <b>{levels['entry']}</b>
-🎯 <b>เป้าหมาย 1</b>: <b>{levels['target1']}</b>  (+{levels['gain1_pct']}%)
-🎯 <b>เป้าหมาย 2</b>: <b>{levels['target2']}</b>  (+{levels['gain2_pct']}%)
-🛑 <b>Stop Loss</b> : <b>{levels['stop_loss']}</b>  (-{levels['risk_pct']}%)
-⚖️ <b>Risk/Reward</b>: {levels['rr']}"""
+        trade_block = (
+            f"\n<b>{levels['action']}</b>\n"
+            f"📌 เข้า  : <b>{levels['entry']}</b>\n"
+            f"🎯 TP1  : <b>{levels['target1']}</b>  (+{levels['gain1']}%)\n"
+            f"🎯 TP2  : <b>{levels['target2']}</b>  (+{levels['gain2']}%)\n"
+            f"🛑 SL   : <b>{levels['stop']}</b>  (-{levels['risk']}%)\n"
+            f"⚖️ R/R  : {levels['rr']}"
+        )
     else:
-        trade_block = f"""
-━━━━━━━━━━━━━━━━━━━━━━
-{sig_emoji} <b>{final_signal}</b>
-   {final_reason}
-   💤 <i>ไม่มีจุดเข้าที่แนะนำตอนนี้ — รอสัญญาณต่อไป</i>"""
+        trade_block = f"\n{sig_emoji} <b>{final_signal}</b> — รอสัญญาณต่อไป"
 
-    msg = f"""
-🥇 <b>GOLD TRADING SIGNAL</b>
-📅 {now}  |  USD/THB: {usd_thb:.2f}
-
-━━━━━━━━━━━━━━━━━━━━━━
-💰 <b>ราคาทองคำ (ฮั่วเซ่งเฮง โดยประมาณ)</b>
-   🌍 XAU/USD  : <b>${price_usd:,.2f}</b>
-   🇹🇭 ทองแท่ง   : <b>฿{thb_price['bar']:,.0f}</b> บาท/บาทน้ำหนัก
-   🇹🇭 รูปพรรณขาย: <b>฿{thb_price['ornament_sell']:,.0f}</b> บาท/บาทน้ำหนัก
-   🇹🇭 รูปพรรณรับซื้อ: <b>฿{thb_price['ornament_buy']:,.0f}</b> บาท/บาทน้ำหนัก
-
-   MA20  : ${float(latest['MA20']):,.2f}
-   MA100 : ${float(latest['MA100']):,.2f}
-   MA200 : ${float(latest['MA200']):,.2f}
-   RSI(14): {rsi:.1f}  |  ATR(14): ${atr14:,.1f}
-
-━━━━━━━━━━━━━━━━━━━━━━
-📊 <b>Technical</b>: {ma_reason}
-📰 <b>Sentiment</b>: {sent_bar}
-   Bullish {sentiment['bullish']} / Bearish {sentiment['bearish']} / Neutral {sentiment['neutral']}  →  <b>{sentiment['label']}</b>
-{trade_block}
-
-━━━━━━━━━━━━━━━━━━━━━━
-🗞 <b>ข่าวสำคัญ ({sentiment['total']} ข่าว / 24h)</b>{news_text}
-
-⚠️ <i>ราคาบาทเป็นการประมาณการจาก XAU/USD×USD/THB
-ราคาจริงอาจต่างจากฮั่วเซ่งเฮง ±200-500 บาท
-ไม่ใช่คำแนะนำลงทุน — ลงทุนมีความเสี่ยง</i>
-""".strip()
-
+    msg = (
+        f"🥇 <b>GOLD SIGNAL</b>  {now}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🇹🇭 ทองแท่ง  : <b>฿{thb_price['bar']:,.0f}</b>\n"
+        f"🇹🇭 รูปพรรณ  : <b>฿{thb_price['ornament_sell']:,.0f}</b> (ขาย)\n"
+        f"🌍 XAU/USD : ${price_usd:,.0f}  |  ฿/{usd_thb:.1f}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Technical</b> : {ma_reason}\n"
+        f"RSI : {rsi:.0f}  |  ATR : ฿{(atr14/31.1035*usd_thb*15.244*0.965):,.0f}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>Confidence</b> : {conf_bar} <b>{confidence}%</b> ({conf_label})\n"
+        f"{sig_emoji} <b>{final_signal}</b>\n"
+        f"{trade_block}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📰 <b>News</b> {sent_icon} <b>{sentiment['label']}</b>"
+        f"  (🟢{bull_pct}% / 🔴{bear_pct}%  |  {sentiment['total']} ข่าว)"
+        f"{news_lines}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>⚠️ ประมาณการเท่านั้น ±500฿  ลงทุนมีความเสี่ยง</i>"
+    )
     return msg
 
 
