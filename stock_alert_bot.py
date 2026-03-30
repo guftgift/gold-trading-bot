@@ -372,11 +372,33 @@ def send_telegram(message: str) -> bool:
         print("─" * 60)
         return True
 
+    # ตรวจสอบ secrets ก่อนส่ง
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN":
+        print("❌ TELEGRAM_BOT_TOKEN ไม่ได้ตั้งค่า (ตรวจสอบ GitHub Secrets)")
+        return False
+    if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID":
+        print("❌ TELEGRAM_CHAT_ID ไม่ได้ตั้งค่า (ตรวจสอบ GitHub Secrets)")
+        return False
+
     url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         r = requests.post(url, data=data, timeout=10)
-        return r.status_code == 200
+        if r.status_code == 200:
+            return True
+        else:
+            # แสดง error จาก Telegram API
+            print(f"❌ Telegram API Error {r.status_code}: {r.text[:200]}")
+            # ถ้า HTML parse error → ลองส่งแบบ plain text
+            if r.status_code == 400 and "parse" in r.text.lower():
+                print("   🔄 ลองส่งแบบ plain text...")
+                data["parse_mode"] = ""
+                r2 = requests.post(url, data=data, timeout=10)
+                if r2.status_code == 200:
+                    print("   ✅ ส่ง plain text สำเร็จ")
+                    return True
+                print(f"   ❌ plain text ก็ fail: {r2.text[:200]}")
+            return False
     except Exception as e:
         print(f"❌ Telegram Error: {e}")
         return False
