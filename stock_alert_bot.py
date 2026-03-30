@@ -23,8 +23,13 @@ import numpy as np
 import feedparser
 import requests
 import os
+import html
 from datetime import datetime, timedelta
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+def esc(text: str) -> str:
+    """Escape HTML special characters สำหรับ Telegram HTML parse_mode"""
+    return html.escape(str(text), quote=False)
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
@@ -448,18 +453,19 @@ def build_stock_block(stock: dict, tech: dict, sentiment: dict,
     bull_pct   = round(sentiment["bullish"] / total_news * 100)
     bear_pct   = round(sentiment["bearish"] / total_news * 100)
 
-    # Top news (max 2)
+    # Top news (max 2) — escape HTML ป้องกัน & < > ใน title
     news_lines = ""
     for n in sentiment["top_news"][:2]:
-        icon = "▲" if "Bullish" in n["sentiment_label"] else "▼"
-        news_lines += f"\n    {icon} {n['title'][:50]}…"
+        icon  = "▲" if "Bullish" in n["sentiment_label"] else "▼"
+        title = esc(n["title"][:50])
+        news_lines += f"\n    {icon} {title}…"
 
-    # Score breakdown (short)
-    bd_str = " | ".join(tech["breakdown"][:4])
+    # Score breakdown — escape special chars
+    bd_str = esc(" | ".join(tech["breakdown"][:4]))
 
     block = (
         f"{'━'*35}\n"
-        f"<b>{stock['symbol']}</b>  <i>{stock['name']}</i>\n"
+        f"<b>{esc(stock['symbol'])}</b>  <i>{esc(stock['name'])}</i>\n"
         f"💵 ราคา   : <b>${price:.2f}</b>  (Cut Loss: ${cut_loss:.2f})\n"
         f"🛡 Status  : {cl_str}\n"
         f"📊 RSI     : {rsi:.0f}  {rsi_label}\n"
@@ -467,10 +473,10 @@ def build_stock_block(stock: dict, tech: dict, sentiment: dict,
         f"📉 MACD    : {'🟢 Bull' if tech['macd'] > tech['macd_signal'] else '🔴 Bear'}"
         f"  |  ATR ${atr:.2f}\n"
         f"📝 Score   : {bd_str}\n"
-        f"📰 News    : {sent_icon} {sentiment['label']}"
+        f"📰 News    : {sent_icon} {esc(sentiment['label'])}"
         f"  ({sentiment['bullish']}🟢 {sentiment['bearish']}🔴  |  {sentiment['total']} ข่าว)"
         f"{news_lines}\n"
-        f"➤ <b>{reason}</b>\n"
+        f"➤ <b>{esc(reason)}</b>\n"
     )
     return block
 
@@ -497,7 +503,7 @@ def build_full_message(results: list) -> str:
         header_emoji = "📊"
         header_title = "STOCK DAILY UPDATE"
 
-    msg = f"{header_emoji} <b>{header_title}</b>  {now}\n"
+    msg = f"{header_emoji} <b>{esc(header_title)}</b>  {esc(now)}\n"
 
     for r in results:
         msg += build_stock_block(
