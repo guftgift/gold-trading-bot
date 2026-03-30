@@ -5,4 +5,5 @@ requests>=2.31.0
 feedparser>=6.0.10
 vaderSentiment>=3.3.2
 beautifulsoup4>=4.12.0
-pandas_ta>=0.3.14b
+# pandas_ta — optional, install manually if needed:
+#   pip install "pandas_ta @ git+https://github.com/twopirllc/pandas-ta@development"
