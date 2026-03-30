@@ -1262,24 +1262,16 @@ def run_bot():
     )
     print(f"   ➜ {final_signal}: {final_reason}")
 
-    NOTIFY_SIGNALS = {
-        "STRONG_BUY", "BUY", "WEAK_BUY",
-        "STRONG_SELL", "SELL",
-        "ACCUMULATE", "CAUTION",
-    }
-
-    if final_signal in NOTIFY_SIGNALS:
-        msg = build_telegram_message(
-            df, ma_signal, ma_reason, sentiment, final_signal, final_reason,
-            real_yield=real_yield, dxy=dxy, futures=futures, fib=fib, td_seq=td_seq,
-            rsi_h4=rsi_h4, support=support, war_inflation=war_inflation,
-            score_breakdown=final_reason,
-        )
-        print("\n📱 [6/6] ส่ง Telegram Alert...")
-        ok = send_telegram(msg)
-        print(f"   {'✅ ส่งสำเร็จ' if ok else '❌ ส่งไม่สำเร็จ'}")
-    else:
-        print(f"\n💤 Signal: {final_signal} — ไม่ส่ง alert (ตลาดปกติ)")
+    # ส่ง Telegram ทุกรอบเสมอ — Daily Market Update
+    msg = build_telegram_message(
+        df, ma_signal, ma_reason, sentiment, final_signal, final_reason,
+        real_yield=real_yield, dxy=dxy, futures=futures, fib=fib, td_seq=td_seq,
+        rsi_h4=rsi_h4, support=support, war_inflation=war_inflation,
+        score_breakdown=final_reason,
+    )
+    print("\n📱 [6/6] ส่ง Telegram Daily Update...")
+    ok = send_telegram(msg)
+    print(f"   {'✅ ส่งสำเร็จ' if ok else '❌ ส่งไม่สำเร็จ'}")
 
     # แสดงข่าวสำคัญ
     if sentiment['top_news']:
