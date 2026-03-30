@@ -459,18 +459,18 @@ def build_stock_block(stock: dict, tech: dict, sentiment: dict,
 
     block = (
         f"{'━'*35}\n"
-        f"{emoji} <b>{stock['symbol']}</b>  <i>{stock['name']}</i>\n"
+        f"<b>{stock['symbol']}</b>  <i>{stock['name']}</i>\n"
         f"💵 ราคา   : <b>${price:.2f}</b>  (Cut Loss: ${cut_loss:.2f})\n"
         f"🛡 Status  : {cl_str}\n"
         f"📊 RSI     : {rsi:.0f}  {rsi_label}\n"
         f"📈 MA      : MA20 ${ma20:.2f}  |  MA50 ${ma50:.2f}\n"
         f"📉 MACD    : {'🟢 Bull' if tech['macd'] > tech['macd_signal'] else '🔴 Bear'}"
         f"  |  ATR ${atr:.2f}\n"
-        f"📝 Score   : <code>{bd_str}</code>\n"
+        f"📝 Score   : {bd_str}\n"
         f"📰 News    : {sent_icon} {sentiment['label']}"
-        f"  (🟢{bull_pct}% 🔴{bear_pct}%  |  {sentiment['total']} ข่าว)"
+        f"  ({sentiment['bullish']}🟢 {sentiment['bearish']}🔴  |  {sentiment['total']} ข่าว)"
         f"{news_lines}\n"
-        f"{emoji} <b>{reason}</b>\n"
+        f"➤ <b>{reason}</b>\n"
     )
     return block
 
