@@ -1,12 +1,14 @@
 """
-Gold Trading Bot — MA Cross (20/100) + MA200 + News Sentiment
-================================================================
-สัญญาณซื้อขายทองคำโดยรวม:
-  1. MA Cross (20/100) — trend signal
-  2. MA200 Filter      — ซื้อเมื่ออยู่เหนือ MA200 เท่านั้น
-  3. News Sentiment    — กรองด้วยข่าวล่าสุด
+Gold Trading Bot — 5-Factor Weight Scoring System
+===================================================
+ระบบสัญญาณซื้อขายทองคำแบบ Weight Scoring 5 ปัจจัยหลัก:
+  1. Macro (DXY + Real Yield 10Y)    — ทิศทางเงิน/ดอกเบี้ย
+  2. Support/Resistance (1D + H4)    — แนวรับ/ต้านสำคัญ
+  3. RSI Oversold/Overbought (1D+H4) — จังหวะกลับตัว
+  4. MA Cross + Trend (20/100/200)   — ทิศทางเทรนด์
+  5. War/Inflation News              — ปัจจัยหนุนทองคำ
 
-แจ้งเตือนผ่าน Telegram พร้อมสรุปข่าวสำคัญ
+แจ้งเตือนผ่าน Telegram พร้อมสรุปข่าวและ Score Breakdown
 """
 
 import yfinance as yf
@@ -17,6 +19,12 @@ import requests
 import asyncio
 from datetime import datetime, timedelta
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+try:
+    import pandas_ta as ta
+    HAS_PANDAS_TA = True
+except ImportError:
+    HAS_PANDAS_TA = False
 
 # ─── ⚙️  CONFIG — รับค่าจาก Environment Variables (GitHub Actions Secrets) ──
 import os
@@ -168,7 +176,117 @@ def get_gold_data(period="1y", interval="1d"):
     loss      = (-delta).clip(lower=0).ewm(com=13, adjust=False).mean()
     df['RSI'] = 100 - (100 / (1 + gain / loss))
 
-    return df.dropna()
+    # pandas_ta indicators (ATR, MACD, Stochastic, Bollinger Bands)
+    if HAS_PANDAS_TA:
+        try:
+            df['ATR14'] = df.ta.atr(length=14)
+        except Exception:
+            pass
+        try:
+            macd = df.ta.macd()
+            df['MACD']        = macd['MACD_12_26_9']
+            df['MACD_SIGNAL'] = macd['MACDs_12_26_9']
+        except Exception:
+            pass
+        try:
+            stoch = df.ta.stoch()
+            df['STOCH_K'] = stoch.iloc[:, 0]
+            df['STOCH_D'] = stoch.iloc[:, 1]
+        except Exception:
+            pass
+        try:
+            bbands = df.ta.bbands(length=20)
+            df['BB_UPPER'] = bbands.iloc[:, 2]
+            df['BB_LOWER'] = bbands.iloc[:, 0]
+        except Exception:
+            pass
+
+    return df.dropna(subset=['MA20', 'MA100', 'MA200', 'RSI'])
+
+
+def get_gold_h4():
+    """
+    ดึงข้อมูล XAU/USD Timeframe H4
+    ใช้สำหรับ RSI H4 และ Support/Resistance ระยะกลาง
+    """
+    try:
+        raw = yf.download("GC=F", period="60d", interval="4h",
+                          auto_adjust=True, progress=False)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        raw = raw[["Close","High","Low","Open","Volume"]].dropna()
+        if len(raw) < 20:
+            return None
+        c = raw['Close']
+        delta = c.diff()
+        gain  = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+        loss  = (-delta).clip(lower=0).ewm(com=13, adjust=False).mean()
+        raw['RSI_H4'] = 100 - (100 / (1 + gain / loss))
+        raw['ATR_H4'] = (raw['High'] - raw['Low']).rolling(14).mean()
+        return raw.dropna()
+    except Exception as e:
+        print(f"  ⚠️ H4 data: {e}")
+        return None
+
+
+def detect_support_level(df_1d, df_h4=None, atr_multiplier=0.5):
+    """
+    ตรวจสอบว่าราคาอยู่ใกล้แนวรับสำคัญหรือไม่
+    วิธี: หา Swing Low ใน 20 แท่งล่าสุด แล้วเช็คว่าราคาปัจจุบัน
+          อยู่ใน zone (swing_low ± ATR * 0.5)
+    Return: True = อยู่ที่แนวรับ (BUY zone)
+    """
+    result = {'at_support': False, 'support_price': None, 'label': ''}
+
+    try:
+        # Swing Low 1D: ต่ำสุดใน window 5 แท่ง
+        window = 5
+        lows = df_1d['Low'].values
+        closes = df_1d['Close'].values
+        atr = float(df_1d['ATR14'].iloc[-1]) if 'ATR14' in df_1d.columns else \
+              float((df_1d['High'] - df_1d['Low']).rolling(14).mean().iloc[-1])
+        current = float(df_1d['Close'].iloc[-1])
+
+        # หา swing lows ใน 30 แท่งล่าสุด
+        swing_lows = []
+        data = df_1d.tail(30)
+        for i in range(window, len(data) - window):
+            low_i = float(data['Low'].iloc[i])
+            if all(low_i <= float(data['Low'].iloc[i-j]) for j in range(1, window+1)) and \
+               all(low_i <= float(data['Low'].iloc[i+j]) for j in range(1, window+1)):
+                swing_lows.append(low_i)
+
+        # nearest swing low
+        if swing_lows:
+            nearest_support = min(swing_lows, key=lambda x: abs(x - current))
+            zone_size = atr * atr_multiplier
+            if abs(current - nearest_support) <= zone_size:
+                result['at_support'] = True
+                result['support_price'] = round(nearest_support, 1)
+                result['label'] = f"✅ At Support ${nearest_support:,.0f} (±${zone_size:.0f})"
+            else:
+                result['label'] = f"Support: ${nearest_support:,.0f} | Current: ${current:,.0f}"
+        else:
+            result['label'] = "No swing low found"
+    except Exception as e:
+        result['label'] = f"Support N/A ({e})"
+
+    # Check H4 support as well
+    if df_h4 is not None and not result['at_support']:
+        try:
+            current = float(df_1d['Close'].iloc[-1])
+            atr_h4 = float(df_h4['ATR_H4'].iloc[-1])
+            h4_lows = df_h4['Low'].tail(60).values
+            # Simple: check if price is near recent H4 low
+            recent_low = float(min(df_h4['Low'].tail(20)))
+            if abs(current - recent_low) <= atr_h4 * 0.5:
+                result['at_support'] = True
+                result['support_price'] = round(recent_low, 1)
+                result['label'] = f"✅ At H4 Support ${recent_low:,.0f}"
+        except Exception:
+            pass
+
+    return result
 
 
 def get_ma_signal(df):
@@ -353,86 +471,174 @@ def analyze_sentiment(news_list):
     }
 
 
+WAR_KEYWORDS = [
+    "war", "attack", "missile", "military", "conflict", "strike",
+    "invasion", "sanction", "geopolitical", "crisis", "tension",
+    "สงคราม", "ความขัดแย้ง", "โจมตี", "วิกฤต",
+]
+
+INFLATION_KEYWORDS = [
+    "inflation", "CPI", "price surge", "cost of living", "hyperinflation",
+    "rate hike", "Fed", "interest rate", "monetary", "stagflation",
+    "เงินเฟ้อ", "ดอกเบี้ย", "เฟด", "ราคาพุ่ง",
+]
+
+def detect_war_inflation(news_list):
+    """
+    ตรวจสอบข่าวสงคราม / เงินเฟ้อ → ปัจจัยหนุนทอง
+    Return dict with war_score (+1) and inflation_score (+1)
+    """
+    war_count       = 0
+    inflation_count = 0
+
+    for news in news_list:
+        text = (news['title'] + ' ' + news['summary']).lower()
+        if any(k.lower() in text for k in WAR_KEYWORDS):
+            war_count += 1
+        if any(k.lower() in text for k in INFLATION_KEYWORDS):
+            inflation_count += 1
+
+    war_score       = 1 if war_count >= 2       else 0
+    inflation_score = 1 if inflation_count >= 3 else 0
+
+    return {
+        'war_count':       war_count,
+        'inflation_count': inflation_count,
+        'war_score':       war_score,
+        'inflation_score': inflation_score,
+        'total':           war_score + inflation_score,
+        'label':           (
+            f"🔫 War: {war_count} ข่าว (+{war_score}pt) | "
+            f"💸 Inflation: {inflation_count} ข่าว (+{inflation_score}pt)"
+        ),
+    }
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  4. MACRO FACTORS — Real Yield · DXY · Futures · Fibonacci · TD Sequential
 # ════════════════════════════════════════════════════════════════════════════
 
 def get_real_yield():
     """
-    Real Yield 10Y จาก FRED (DFII10 — TIPS 10Y)
+    Real Yield 10Y จาก yfinance (^TNX = US 10Y Treasury Nominal Yield)
+    Real Yield ≈ Nominal Yield (^TNX) − CPI เฉลี่ย (~2.5%)
+
     Real Yield ↑ → เงินไหลเข้าพันธบัตร → ทองลง  (BEARISH)
     Real Yield ↓ → เงินหนีออกพันธบัตร  → ทองขึ้น (BULLISH)
     """
-    import io
-    try:
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10"
-        r   = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        df  = pd.read_csv(io.StringIO(r.text))
-        df.columns = ['date', 'real_yield']
-        df  = df[df['real_yield'] != '.'].copy()
-        df['real_yield'] = df['real_yield'].astype(float)
-        df  = df.dropna().tail(10)
+    ASSUMED_CPI = 2.5   # ค่าเฉลี่ย CPI สหรัฐ (%)
 
-        current = float(df['real_yield'].iloc[-1])
-        prev    = float(df['real_yield'].iloc[max(-6, -len(df))])
+    try:
+        raw = yf.download("^TNX", period="1mo", interval="1d",
+                          auto_adjust=True, progress=False)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        closes = raw['Close'].dropna()
+        if len(closes) < 5:
+            raise ValueError("ข้อมูลไม่พอ")
+
+        nominal = float(closes.iloc[-1])
+        current = round(nominal - ASSUMED_CPI, 2)   # Real Yield
+        prev    = float(closes.iloc[max(-6, -len(closes))]) - ASSUMED_CPI
         trend   = current - prev
 
         signal    = 'BULLISH' if current < 0.5 else ('BEARISH' if current > 1.5 else 'NEUTRAL')
         direction = '↑' if trend > 0.05 else ('↓' if trend < -0.05 else '→')
         return {
-            'value':     round(current, 2),
+            'nominal':   round(nominal, 2),
+            'value':     current,
             'trend':     round(trend,   2),
             'direction': direction,
             'signal':    signal,
-            'label':     f"{current:+.2f}% {direction}",
+            'label':     f"{current:+.2f}% {direction}  (^TNX {nominal:.2f}%)",
         }
     except Exception as e:
-        print(f"  ⚠️ Real Yield: {e}")
-        return {'value': None, 'signal': 'NEUTRAL', 'label': 'N/A',
-                'direction': '→', 'trend': 0}
+        print(f"  ⚠️ Real Yield (yfinance ^TNX): {e}")
+        return {'nominal': None, 'value': None, 'signal': 'NEUTRAL',
+                'label': 'N/A', 'direction': '→', 'trend': 0}
 
 
 def get_dxy_data():
     """
-    Dollar Index (DXY)
+    Dollar Index (DXY) จาก yfinance / Alpha Vantage
+
+    ลำดับ fallback:
+      1. DX-Y.NYB  — ICE US Dollar Index Spot (Yahoo Finance) ✅
+      2. UUP       — Invesco DB USD Bull ETF (proxy, ×3.6 ≈ DXY)
+      3. Alpha Vantage FX_DAILY (ต้องตั้ง env ALPHA_VANTAGE_KEY)
+
     DXY ↑ / เหนือ MA20 → ทองอ่อน (BEARISH)
     DXY ↓ / ต่ำกว่า MA20 → ทองแข็ง (BULLISH)
-    เพราะทองราคาเป็น USD: USD แข็ง = ทองแพงสำหรับคนทั้งโลก = demand ลด
     """
-    for sym in ["dxy", "dx.f"]:
-        try:
-            df      = _stooq_fetch(sym, days=40)
-            now     = float(df['Close'].iloc[-1])
-            prev    = float(df['Close'].iloc[max(-6, -len(df))])
-            ma20    = float(df['Close'].rolling(20).mean().iloc[-1])
-            w_chg   = (now - prev) / prev * 100
+    def _calc(closes):
+        now   = float(closes.iloc[-1])
+        prev  = float(closes.iloc[max(-6, -len(closes))])
+        ma20  = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else now
+        w_chg = (now - prev) / prev * 100
+        signal    = ('BEARISH' if now > ma20 and w_chg >  0.2 else
+                     'BULLISH' if now < ma20 and w_chg < -0.2 else 'NEUTRAL')
+        direction = '↑' if w_chg > 0.2 else ('↓' if w_chg < -0.2 else '→')
+        return {
+            'value':         round(now,   2),
+            'weekly_change': round(w_chg, 2),
+            'above_ma20':    now > ma20,
+            'signal':        signal,
+            'direction':     direction,
+            'label':         f"{now:.2f} ({w_chg:+.2f}%w) {direction}",
+        }
 
-            signal    = ('BEARISH' if now > ma20 and w_chg >  0.2 else
-                         'BULLISH' if now < ma20 and w_chg < -0.2 else 'NEUTRAL')
-            direction = '↑' if w_chg > 0.2 else ('↓' if w_chg < -0.2 else '→')
-            return {
-                'value':         round(now,   2),
-                'weekly_change': round(w_chg, 2),
-                'above_ma20':    now > ma20,
-                'signal':        signal,
-                'direction':     direction,
-                'label':         f"{now:.1f} ({w_chg:+.1f}%w) {direction}",
-            }
-        except Exception as e:
-            print(f"  ⚠️ DXY {sym}: {e}")
-
+    # ── วิธีที่ 1: DX-Y.NYB (ICE Dollar Index Spot บน Yahoo Finance) ──
     try:
-        raw = yf.download("DX=F", period="2mo", interval="1d",
+        raw = yf.download("DX-Y.NYB", period="2mo", interval="1d",
                           auto_adjust=True, progress=False)
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
-        now = float(raw['Close'].dropna().iloc[-1])
-        return {'value': round(now, 2), 'signal': 'NEUTRAL', 'direction': '→',
-                'weekly_change': 0, 'above_ma20': None, 'label': f"{now:.1f}"}
-    except Exception:
-        return {'value': None, 'signal': 'NEUTRAL', 'direction': '→',
-                'weekly_change': 0, 'above_ma20': None, 'label': 'N/A'}
+        closes = raw['Close'].dropna()
+        if len(closes) >= 5:
+            print("   ✅ DXY จาก yfinance: DX-Y.NYB")
+            return _calc(closes)
+    except Exception as e:
+        print(f"  ⚠️ DXY DX-Y.NYB: {e}")
+
+    # ── วิธีที่ 2: UUP ETF (Invesco DB USD Bullish) × scale ≈ DXY ──
+    try:
+        raw = yf.download("UUP", period="2mo", interval="1d",
+                          auto_adjust=True, progress=False)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        closes = raw['Close'].dropna()
+        if len(closes) >= 5:
+            # scale UUP → DXY approximate (UUP ~27-28 = DXY ~100)
+            scale  = 3.59
+            closes = closes * scale
+            print("   ✅ DXY จาก yfinance: UUP (proxy ×3.59)")
+            return _calc(closes)
+    except Exception as e:
+        print(f"  ⚠️ DXY UUP: {e}")
+
+    # ── วิธีที่ 3: Alpha Vantage (ต้องตั้ง env ALPHA_VANTAGE_KEY) ──
+    av_key = os.environ.get("ALPHA_VANTAGE_KEY", "")
+    if av_key:
+        try:
+            url = (f"https://www.alphavantage.co/query"
+                   f"?function=FX_DAILY&from_symbol=USD&to_symbol=EUR"
+                   f"&outputsize=compact&apikey={av_key}")
+            r   = requests.get(url, timeout=10)
+            data = r.json().get("Time Series FX (Daily)", {})
+            if data:
+                dates  = sorted(data.keys(), reverse=True)[:30]
+                # USD/EUR inverse ≈ rough DXY proxy (EUR weight 57.6%)
+                closes = pd.Series(
+                    {d: 1 / float(data[d]['4. close']) * 57.6 for d in dates}
+                ).sort_index()
+                print("   ✅ DXY จาก Alpha Vantage (USD/EUR proxy)")
+                return _calc(closes)
+        except Exception as e:
+            print(f"  ⚠️ DXY Alpha Vantage: {e}")
+
+    print("  ❌ DXY: ดึงข้อมูลไม่ได้จากทุกแหล่ง")
+    return {'value': None, 'signal': 'NEUTRAL', 'direction': '→',
+            'weekly_change': 0, 'above_ma20': None, 'label': 'N/A'}
 
 
 def get_futures_analysis(df_spot):
@@ -592,78 +798,168 @@ def calc_td_sequential(df):
 
 def combine_signals(ma_signal, sentiment,
                     real_yield=None, dxy=None,
-                    futures=None, fib=None, td_seq=None):
+                    futures=None, fib=None, td_seq=None,
+                    rsi_1d=50.0, rsi_h4=50.0,
+                    support=None, war_inflation=None):
     """
-    รวม 5 ปัจจัยหลัก (Score-based — ไม่ใช่แค่ Matrix 2×2)
+    ════════════════════════════════════════════════════
+    Weight Scoring System — ตัดสินใจเข้าซื้อสะสมทอง
+    ════════════════════════════════════════════════════
 
-    น้ำหนัก:
-      MA Cross   : 3  (Trend signal)
-      Real Yield : 3  (ตัวคุมเกมตัวจริง)
-      DXY        : 3  (แรงโน้มถ่วงทอง)
-      Futures    : 2  (แรงจริงของ COMEX)
-      Sentiment  : 2  (กับดัก / fuel)
-      Fibonacci  : 2  (WHERE)
-      TD Seq     : 2  (WHEN — exhaustion)
+    ┌─────────────────────────────────────────┬──────┐
+    │ ปัจจัย                                  │ คะแนน│
+    ├─────────────────────────────────────────┼──────┤
+    │ DXY ↓ AND Yield 10Y ↓ (พร้อมกัน)       │  +2  │
+    │ ราคาแตะแนวรับสำคัญ (1D หรือ H4)        │  +3  │
+    │ RSI < 30 Oversold (1D)                  │  +3  │
+    │ RSI < 35 Oversold (H4)                  │  +2  │
+    │ MA Golden Cross (20/100)                │  +2  │
+    │ Trend Uptrend (MA20 > MA100 > MA200)    │  +1  │
+    │ TD Sequential Buy Setup ≥ 9             │  +1  │
+    │ Fibonacci Golden Zone (50–61.8%)        │  +1  │
+    │ COMEX Backwardation / GLD inflow        │  +1  │
+    │ ข่าวสงคราม / geopolitical               │  +1  │
+    │ ข่าวเงินเฟ้อพุ่ง                        │  +1  │
+    │ Sentiment BULLISH รวม                   │  +1  │
+    ├─────────────────────────────────────────┼──────┤
+    │ DXY ↑ AND Yield ↑ (พร้อมกัน)           │  -2  │
+    │ ราคาแตะแนวต้านสำคัญ / RSI > 70 (1D)   │  -3  │
+    │ RSI > 65 (H4)                           │  -2  │
+    │ MA Death Cross                          │  -2  │
+    │ TD Sequential Sell Setup ≥ 9           │  -2  │
+    │ Sentiment BEARISH รวม                   │  -1  │
+    └─────────────────────────────────────────┴──────┘
+
+    Action:
+      score > 5  → BUY / STRONG BUY
+      score 3–5  → WEAK BUY / ACCUMULATE
+      score < -5 → SELL / STRONG SELL
+      อื่นๆ     → HOLD / STAY OUT
     """
-    bull = 0
-    bear = 0
+    score     = 0
+    breakdown = []
 
-    # 1. MA Cross
-    if ma_signal == 'BUY':             bull += 3
-    elif ma_signal == 'HOLD_BULLISH':  bull += 2
-    elif ma_signal == 'SELL':          bear += 3
-    elif ma_signal == 'HOLD_BEARISH':  bear += 2
+    # ── 1. MACRO: DXY & Yield 10Y (negative correlation กับทอง) ──
+    dxy_falling   = dxy and dxy['signal'] == 'BULLISH'       # DXY ↓ = bullish gold
+    yield_falling = real_yield and real_yield['signal'] == 'BULLISH'  # Yield ↓ = bullish gold
+    dxy_rising    = dxy and dxy['signal'] == 'BEARISH'
+    yield_rising  = real_yield and real_yield['signal'] == 'BEARISH'
 
-    # 2. Real Yield
-    if real_yield:
-        if real_yield['signal'] == 'BULLISH':  bull += 3
-        elif real_yield['signal'] == 'BEARISH': bear += 3
+    if dxy_falling and yield_falling:
+        score += 2
+        breakdown.append("DXY↓+Yield↓ +2")
+    elif dxy_falling or yield_falling:
+        score += 1
+        breakdown.append("DXY/Yield↓ +1")
+    elif dxy_rising and yield_rising:
+        score -= 2
+        breakdown.append("DXY↑+Yield↑ -2")
+    elif dxy_rising or yield_rising:
+        score -= 1
+        breakdown.append("DXY/Yield↑ -1")
 
-    # 3. DXY
-    if dxy:
-        if dxy['signal'] == 'BULLISH':  bull += 3
-        elif dxy['signal'] == 'BEARISH': bear += 3
+    # ── 2. TECHNICAL: Support Level ──
+    if support and support['at_support']:
+        score += 3
+        breakdown.append("At Support +3")
+    elif support and support['support_price']:
+        # ใกล้ support แต่ยังไม่ถึง
+        pass
 
-    # 4. Futures / COMEX
-    if futures:
-        if futures['overall'] == 'BULLISH':  bull += 2
-        elif futures['overall'] == 'BEARISH': bear += 2
+    # ── 3. TECHNICAL: RSI Oversold / Overbought ──
+    if rsi_1d < 30:
+        score += 3
+        breakdown.append(f"RSI1D {rsi_1d:.0f}<30 +3")
+    elif rsi_1d < 40:
+        score += 1
+        breakdown.append(f"RSI1D {rsi_1d:.0f}<40 +1")
+    elif rsi_1d > 70:
+        score -= 3
+        breakdown.append(f"RSI1D {rsi_1d:.0f}>70 -3")
+    elif rsi_1d > 60:
+        score -= 1
+        breakdown.append(f"RSI1D {rsi_1d:.0f}>60 -1")
 
-    # 5. Sentiment
-    if sentiment['label'] == 'BULLISH':   bull += 2
-    elif sentiment['label'] == 'BEARISH': bear += 2
+    if rsi_h4 < 35:
+        score += 2
+        breakdown.append(f"RSI_H4 {rsi_h4:.0f}<35 +2")
+    elif rsi_h4 > 65:
+        score -= 2
+        breakdown.append(f"RSI_H4 {rsi_h4:.0f}>65 -2")
 
-    # 6. Fibonacci
-    if fib:
-        if fib['signal'] in ('BULLISH', 'STRONG_BULLISH'): bull += 2
-        elif fib['signal'] == 'BEARISH':                    bear += 2
-
-    # 7. TD Sequential exhaustion override
-    if td_seq:
-        if td_seq['signal'] == 'SELL_SETUP': bear += 2
-        elif td_seq['signal'] == 'BUY_SETUP': bull += 2
-
-    total = bull + bear
-    net   = bull - bear
-
-    if net >= 8:
-        return "STRONG_BUY",  f"✅ STRONG BUY  — {bull}/{total} pts"
-    elif net >= 4:
-        return "BUY",          f"✅ BUY          — {bull}/{total} pts"
-    elif net >= 2:
-        return "WEAK_BUY",     f"⚠️  WEAK BUY    — {bull}/{total} pts"
-    elif net <= -8:
-        return "STRONG_SELL",  f"🔴 STRONG SELL  — {bear}/{total} pts"
-    elif net <= -4:
-        return "SELL",          f"🔴 SELL          — {bear}/{total} pts"
-    elif net <= -2:
-        return "WEAK_SELL",    f"🟠 WEAK SELL    — {bear}/{total} pts"
-    elif ma_signal == 'HOLD_BULLISH' and net >= 0:
-        return "HOLD",          f"📈 HOLD          — Uptrend {bull}/{total} pts"
+    # ── 4. TECHNICAL: MA Cross / Trend ──
+    if ma_signal == 'BUY':
+        score += 2
+        breakdown.append("Golden Cross +2")
     elif ma_signal == 'HOLD_BULLISH':
-        return "CAUTION",       f"⚠️  CAUTION      — Mixed {bull}/{total} pts"
+        score += 1
+        breakdown.append("Uptrend +1")
+    elif ma_signal == 'SELL':
+        score -= 2
+        breakdown.append("Death Cross -2")
+    elif ma_signal == 'HOLD_BEARISH':
+        score -= 1
+        breakdown.append("Downtrend -1")
+
+    # ── 5. TECHNICAL: TD Sequential ──
+    if td_seq:
+        if td_seq['signal'] == 'BUY_SETUP':
+            score += 1
+            breakdown.append("TD BuySetup +1")
+        elif td_seq['signal'] == 'SELL_SETUP':
+            score -= 2
+            breakdown.append("TD SellSetup -2")
+
+    # ── 6. TECHNICAL: Fibonacci ──
+    if fib and fib['signal'] == 'STRONG_BULLISH':
+        score += 1
+        breakdown.append("Fib GoldenZone +1")
+
+    # ── 7. FUTURES: COMEX / Institutional ──
+    if futures and futures['overall'] == 'BULLISH':
+        score += 1
+        breakdown.append("Futures Bull +1")
+    elif futures and futures['overall'] == 'BEARISH':
+        score -= 1
+        breakdown.append("Futures Bear -1")
+
+    # ── 8. SENTIMENT: War / Inflation / Overall ──
+    if war_inflation:
+        if war_inflation['war_score'] > 0:
+            score += 1
+            breakdown.append(f"War news +1")
+        if war_inflation['inflation_score'] > 0:
+            score += 1
+            breakdown.append(f"Inflation news +1")
+
+    if sentiment['label'] == 'BULLISH':
+        score += 1
+        breakdown.append("Sent Bull +1")
+    elif sentiment['label'] == 'BEARISH':
+        score -= 1
+        breakdown.append("Sent Bear -1")
+
+    # ── Final Decision ──
+    score_str = f"Score: {score:+d}  [{', '.join(breakdown)}]"
+
+    if score >= 9:
+        return "STRONG_BUY",  f"🚀 STRONG BUY  — {score_str}"
+    elif score >= 6:
+        return "BUY",          f"✅ BUY          — {score_str}"
+    elif score >= 3:
+        return "WEAK_BUY",     f"⚠️  WEAK BUY    — {score_str}"
+    elif score <= -9:
+        return "STRONG_SELL",  f"🔴 STRONG SELL  — {score_str}"
+    elif score <= -6:
+        return "SELL",          f"🔴 SELL          — {score_str}"
+    elif score <= -3:
+        return "WEAK_SELL",    f"🟠 WEAK SELL    — {score_str}"
+    elif ma_signal in ('HOLD_BULLISH', 'BUY') and score >= 0:
+        return "HOLD",          f"📈 HOLD          — {score_str}"
+    elif score < 0:
+        return "CAUTION",       f"⚠️  CAUTION      — {score_str}"
     else:
-        return "STAY_OUT",      f"🚫 STAY OUT     — ต่ำกว่า MA200"
+        return "STAY_OUT",      f"🚫 STAY OUT     — {score_str}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -696,48 +992,49 @@ def send_telegram(message: str):
 
 def calc_confidence(ma_signal, sentiment, rsi,
                     real_yield=None, dxy=None,
-                    futures=None, fib=None, td_seq=None):
+                    futures=None, fib=None, td_seq=None,
+                    rsi_h4=50.0, support=None, war_inflation=None):
     """
-    คำนวณ Confidence Score 0-99 จาก 5 ปัจจัยหลัก
-      MA     : 0-25  |  Sentiment: 0-15  |  RSI: 0-10
-      Yield  : 0-15  |  DXY      : 0-15  |  Fib/TD: 0-10
+    Confidence Score 0-99 อิงจาก weight scoring
+    สูงสุดที่เป็นไปได้ ~90 pts (หาร ~0.9 = 0-100%)
     """
-    # MA (0-25)
-    ma_score = {
-        "BUY": 25, "STRONG_BUY": 25,
-        "ACCUMULATE": 20, "HOLD_BULLISH": 18,
-        "HOLD": 12, "CAUTION": 8,
-        "WEAK_BUY": 15, "WEAK_SELL": 15,
-        "SELL": 5, "STRONG_SELL": 0,
-        "STAY_OUT": 0, "HOLD_BEARISH": 5,
-    }.get(ma_signal, 12)
+    pts = 0
 
-    # Sentiment (0-15)
-    sent_score = min(15, max(0, int((sentiment['score'] + 1) / 2 * 15)))
+    # Macro (max 15)
+    dxy_ok   = dxy and dxy['signal'] == 'BULLISH'
+    yield_ok = real_yield and real_yield['signal'] == 'BULLISH'
+    if dxy_ok and yield_ok: pts += 15
+    elif dxy_ok or yield_ok: pts += 8
 
-    # RSI (0-10)
-    if 40 <= rsi <= 60:           rsi_score = 10
-    elif 30 <= rsi < 40 or 60 < rsi <= 70: rsi_score = 7
-    elif rsi < 30:                rsi_score = 8   # oversold = โอกาสดี
-    else:                         rsi_score = 3   # overbought
+    # RSI oversold bonus (max 20)
+    if rsi < 30:      pts += 20
+    elif rsi < 40:    pts += 12
+    elif rsi < 50:    pts += 6
+    if rsi_h4 < 35:   pts += 10
+    elif rsi_h4 < 45: pts += 5
 
-    # Real Yield (0-15)
-    ry_score = {'BULLISH': 15, 'NEUTRAL': 7, 'BEARISH': 0}.get(
-        real_yield['signal'] if real_yield else 'NEUTRAL', 7)
+    # Support zone (max 20)
+    if support and support['at_support']: pts += 20
 
-    # DXY (0-15)
-    dxy_score = {'BULLISH': 15, 'NEUTRAL': 7, 'BEARISH': 0}.get(
-        dxy['signal'] if dxy else 'NEUTRAL', 7)
+    # MA / Trend (max 15)
+    ma_pts = {'BUY': 15, 'HOLD_BULLISH': 10, 'HOLD': 6,
+              'WEAK_BUY': 8, 'CAUTION': 4, 'SELL': 0,
+              'STRONG_SELL': 0, 'STAY_OUT': 0}.get(ma_signal, 6)
+    pts += ma_pts
 
-    # Fibonacci + TD Sequential (0-10)
-    tech2 = 5
-    if fib:
-        tech2 = {'STRONG_BULLISH': 10, 'BULLISH': 8,
-                 'NEUTRAL': 5, 'BEARISH': 0}.get(fib['signal'], 5)
-    if td_seq and td_seq['exhaustion']:
-        tech2 = max(0, tech2 - 5)   # penalise momentum exhaustion
+    # Sentiment + War/Inflation (max 15)
+    pts += min(15, max(0, int((sentiment['score'] + 1) / 2 * 10)))
+    if war_inflation:
+        pts += war_inflation['total'] * 3
 
-    return min(99, ma_score + sent_score + rsi_score + ry_score + dxy_score + tech2)
+    # Futures + Fib (max 10)
+    if futures and futures['overall'] == 'BULLISH': pts += 5
+    if fib and fib['signal'] == 'STRONG_BULLISH':   pts += 5
+
+    # TD penalty
+    if td_seq and td_seq['exhaustion']: pts = max(0, pts - 10)
+
+    return min(99, pts)
 
 
 def calc_trade_levels_thb(price_usd, signal, atr_usd, ma200_usd, usd_thb):
@@ -793,7 +1090,8 @@ def calc_trade_levels_thb(price_usd, signal, atr_usd, ma200_usd, usd_thb):
 
 
 def build_telegram_message(df, ma_signal, ma_reason, sentiment, final_signal, final_reason,
-                            real_yield=None, dxy=None, futures=None, fib=None, td_seq=None):
+                            real_yield=None, dxy=None, futures=None, fib=None, td_seq=None,
+                            rsi_h4=50.0, support=None, war_inflation=None, score_breakdown=""):
     """สร้างข้อความ Telegram พร้อม 5 ปัจจัยหลัก"""
     latest    = df.iloc[-1]
     now       = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -806,7 +1104,9 @@ def build_telegram_message(df, ma_signal, ma_reason, sentiment, final_signal, fi
     thb_price = usd_to_thb_gold(price_usd, usd_thb)
 
     confidence = calc_confidence(final_signal, sentiment, rsi,
-                                 real_yield, dxy, futures, fib, td_seq)
+                                 real_yield, dxy, futures, fib, td_seq,
+                                 rsi_h4=rsi_h4, support=support,
+                                 war_inflation=war_inflation)
     conf_bar   = "█" * (confidence // 10) + "░" * (10 - confidence // 10)
     conf_label = ("สูงมาก" if confidence >= 80 else
                   "ดี"     if confidence >= 60 else
@@ -870,11 +1170,15 @@ def build_telegram_message(df, ma_signal, ma_reason, sentiment, final_signal, fi
         f"  {fut_icon} Futures    : {fut_lbl}\n"
         f"  📐 Fibonacci : {fib_lbl}\n"
         f"  🕰 TD Seq    : {td_lbl}\n"
+        f"  📊 RSI H4    : {rsi_h4:.0f} {'🟢 Oversold' if rsi_h4 < 35 else '🔴 Overbought' if rsi_h4 > 65 else '⚪ Normal'}\n"
+        f"  🛡 Support   : {support['label'] if support else 'N/A'}\n"
+        f"  🔫 War/Infl  : {war_inflation['label'] if war_inflation else 'N/A'}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Technical</b> : {ma_reason}\n"
         f"RSI : {rsi:.0f}  |  ATR : ฿{(atr14/31.1035*usd_thb*15.244*0.965):,.0f}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 <b>Confidence</b> : {conf_bar} <b>{confidence}%</b> ({conf_label})\n"
+        f"📝 Score: <code>{score_breakdown[:80]}</code>\n"
         f"{sig_emoji} <b>{final_signal}</b>  {final_reason}\n"
         f"{trade_block}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -910,6 +1214,13 @@ def run_bot():
     print(f"   รูปพรรณขาย    : ฿{thb['ornament_sell']:,.0f}")
     print(f"   MA Signal     : {ma_signal} — {ma_reason}")
 
+    # H4 data
+    df_h4 = get_gold_h4()
+    rsi_h4 = float(df_h4['RSI_H4'].iloc[-1]) if df_h4 is not None else 50.0
+
+    # Support detection
+    support = detect_support_level(df, df_h4)
+
     # Step 2: Macro Factors
     print("\n🌐 [2/6] วิเคราะห์ Macro Factors...")
     real_yield = get_real_yield()
@@ -922,6 +1233,8 @@ def run_bot():
     print(f"   Futures    : {futures['label']}  ({futures['overall']})")
     print(f"   Fibonacci  : {fib['zone']}")
     print(f"   TD Seq     : {td_seq['label']}")
+    print(f"   RSI H4        : {rsi_h4:.1f}")
+    print(f"   Support       : {support['label']}")
 
     # Step 3: ข่าว
     print("\n📰 [3/6] ดึงข่าวทองคำจาก RSS feeds...")
@@ -933,6 +1246,8 @@ def run_bot():
     sentiment = analyze_sentiment(news)
     print(f"   Overall: {sentiment['label']} (score: {sentiment['score']:+.3f})")
     print(f"   Bullish: {sentiment['bullish']} | Bearish: {sentiment['bearish']} | Neutral: {sentiment['neutral']}")
+    war_inflation = detect_war_inflation(news)
+    print(f"   {war_inflation['label']}")
 
     # Step 5: รวมสัญญาณ (5 ปัจจัย)
     print("\n🎯 [5/6] คำนวณ Final Signal (5 ปัจจัย)...")
@@ -940,6 +1255,10 @@ def run_bot():
         ma_signal, sentiment,
         real_yield=real_yield, dxy=dxy,
         futures=futures, fib=fib, td_seq=td_seq,
+        rsi_1d=float(df.iloc[-1]['RSI']),
+        rsi_h4=rsi_h4,
+        support=support,
+        war_inflation=war_inflation,
     )
     print(f"   ➜ {final_signal}: {final_reason}")
 
@@ -953,6 +1272,8 @@ def run_bot():
         msg = build_telegram_message(
             df, ma_signal, ma_reason, sentiment, final_signal, final_reason,
             real_yield=real_yield, dxy=dxy, futures=futures, fib=fib, td_seq=td_seq,
+            rsi_h4=rsi_h4, support=support, war_inflation=war_inflation,
+            score_breakdown=final_reason,
         )
         print("\n📱 [6/6] ส่ง Telegram Alert...")
         ok = send_telegram(msg)
@@ -968,9 +1289,10 @@ def run_bot():
 
     return {
         'signal':    final_signal,
-        'price':     float(latest['Close']),
+        'price':     float(df.iloc[-1]['Close']),
         'sentiment': sentiment['score'],
         'news_count': len(news),
+        'score':     final_reason,
     }
 
 
