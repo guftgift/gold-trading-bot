@@ -1,0 +1,24 @@
+# Secrets — ห้าม commit
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml

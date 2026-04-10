@@ -1,9 +1,17 @@
+# Core data & analysis
 yfinance>=0.2.36
 pandas>=2.0.0
 numpy>=1.24.0
 requests>=2.31.0
+
+# Gold trading bot (gold_trading_bot.py)
 feedparser>=6.0.10
 vaderSentiment>=3.3.2
 beautifulsoup4>=4.12.0
-# pandas_ta — optional, install manually if needed:
-#   pip install "pandas_ta @ git+https://github.com/twopirllc/pandas-ta@development"
+
+# Simulation & Dashboard (gold_simulation.py + dashboard.py)
+streamlit>=1.35.0
+plotly>=5.20.0
+
+# Optional — advanced indicators (uncomment to install):
+# pandas_ta @ git+https://github.com/twopirllc/pandas-ta@development
