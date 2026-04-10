@@ -20,5 +20,5 @@ env/
 # macOS
 .DS_Store
 
-# Streamlit
+# Streamlit — block real secrets, allow config & example
 .streamlit/secrets.toml
