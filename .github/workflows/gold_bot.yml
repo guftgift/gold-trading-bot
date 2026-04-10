@@ -1,16 +1,15 @@
 name: 🥇 Gold Trading Bot
 
 on:
-  # ─── รันอัตโนมัติตามตาราง (UTC time) ───────────────────────────────
-  # ตลาดไทย/ลอนดอน/นิวยอร์ก — รัน 4 รอบต่อวัน วันจันทร์-ศุกร์
-  # UTC+7 (ไทย) ดังนั้น UTC 02:00 = 09:00 น. ไทย
+  # ─── รันอัตโนมัติตามตาราง (UTC time) ─────────────────────────────────────
+  # UTC+7 (ไทย): UTC 02 = 09:00, UTC 05 = 12:00, UTC 09 = 16:00, UTC 13 = 20:00
   schedule:
-    - cron: '0 2  * * *'   # 09:00 น. ไทย (เปิดตลาดเช้า)
-    - cron: '0 5  * * *'   # 12:00 น. ไทย (กลางวัน)
-    - cron: '0 9  * * *'   # 16:00 น. ไทย (บ่าย)
-    - cron: '0 13 * * *'   # 20:00 น. ไทย (ตลาดนิวยอร์กเปิด)
+    - cron: '0 2  * * 1-5'   # 09:00 น. ไทย — จันทร์-ศุกร์
+    - cron: '0 5  * * 1-5'   # 12:00 น. ไทย
+    - cron: '0 9  * * 1-5'   # 16:00 น. ไทย
+    - cron: '0 13 * * 1-5'   # 20:00 น. ไทย (ตลาดนิวยอร์กเปิด)
 
-  # ─── รันมือได้ทันที (กดปุ่มใน GitHub Actions) ─────────────────────
+  # ─── รันมือได้ทันที ──────────────────────────────────────────────────────
   workflow_dispatch:
     inputs:
       dry_run:
@@ -18,20 +17,23 @@ on:
         required: false
         default: 'false'
         type: choice
-        options:
-          - 'false'
-          - 'true'
+        options: ['false', 'true']
+
+permissions:
+  contents: write   # อนุญาตให้ commit trades.json กลับเข้า repo
 
 jobs:
-  run-gold-bot:
-    name: Run Gold Trading Signal Bot
+  signal-check:
+    name: 📡 Check Gold Signal
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      # 1. Checkout โค้ด
+      # 1. Checkout (ดึงโค้ด + trades.json ล่าสุดจาก repo)
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       # 2. ติดตั้ง Python
       - name: 🐍 Setup Python 3.11
@@ -44,17 +46,37 @@ jobs:
       - name: 📦 Install dependencies
         run: pip install -r requirements.txt
 
-      # 4. รัน Bot
-      - name: 🤖 Run Gold Trading Bot
+      # 4. รัน live monitor (--once = ตรวจ 1 รอบแล้วออก)
+      - name: 🤖 Run Live Monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
-        run: python gold_trading_bot.py
+        run: python live_monitor.py --once
 
-      # 5. แสดง log ถ้า fail
+      # 5. Commit trades.json กลับเข้า repo (เพื่อ persist state ข้าม run)
+      #    [skip ci] ป้องกัน loop trigger
+      - name: 💾 Save trades.json to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add trades.json
+          git diff --staged --quiet \
+            && echo "No changes to trades.json — skipping commit" \
+            || git commit -m "chore: update trades.json $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
+          git push
+
+      # 6. แสดง status สรุป
+      - name: 📊 Show status
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python live_monitor.py --status
+
+      # 7. แสดง error log ถ้า fail
       - name: 📋 Show error log (on failure)
         if: failure()
         run: |
           echo "❌ Bot run failed — check logs above"
-          echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
