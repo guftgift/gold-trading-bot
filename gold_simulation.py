@@ -59,64 +59,77 @@ class SimConfig:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _stooq_fetch(symbol: str, days: int = 500) -> pd.DataFrame:
-    """ดึง OHLC จาก Stooq — ฟรี ไม่ต้อง API key"""
+    """
+    ดึง OHLC จาก Stooq
+    หมายเหตุ: Stooq เริ่มต้องใช้ API key สำหรับบาง symbol (เช่น xauusd)
+    ถ้า response ไม่ใช่ CSV ที่มีคอลัมน์ Date → raise ValueError ทันที
+    """
     end   = date.today()
     start = end - timedelta(days=days)
     url   = (f"https://stooq.com/q/d/l/?s={symbol}"
              f"&d1={start.strftime('%Y%m%d')}"
              f"&d2={end.strftime('%Y%m%d')}&i=d")
-    r  = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text), index_col="Date", parse_dates=True)
+    text = r.text.strip()
+    # Guard: Stooq ส่ง API-key error หรือข้อมูลว่างกลับมา
+    if not text or not text.lower().startswith("date"):
+        raise ValueError(f"Stooq {symbol}: non-CSV response (API key required or empty)")
+    df = pd.read_csv(io.StringIO(text), index_col="Date", parse_dates=True)
     df.columns = [c.capitalize() for c in df.columns]
     df = df.sort_index().dropna()
     if "Close" not in df.columns or len(df) < 10:
-        raise ValueError(f"No usable data from Stooq for {symbol}")
+        raise ValueError(f"Stooq {symbol}: insufficient data ({len(df)} rows)")
     return df
 
 
 def fetch_historical_data(config: SimConfig) -> pd.DataFrame:
     """
     ดึงข้อมูล OHLC ย้อนหลังของ XAU/USD
-    Fallback: Stooq XAUUSD → Stooq GC.F → yfinance GC=F → GLD → IAU
+    Fallback order (Stooq เป็น optional เพราะต้องการ API key บางตัว):
+      1. yfinance GC=F  — Gold Futures (primary)
+      2. yfinance GLD   — Gold ETF ×10
+      3. yfinance IAU   — Gold ETF ×50
+      4. Stooq gc.f     — ถ้ายังใช้ได้
     คืน raw DataFrame (ยังไม่ dropna — indicators คำนวณ later)
     """
     import yfinance as yf
 
     df = None
 
-    # ─── Stooq sources ───────────────────────────────────────────────────────
-    for sym in ["xauusd", "gc.f"]:
+    # ─── yfinance (primary) ───────────────────────────────────────────────────
+    for sym, mult in [("GC=F", 1.0), ("GLD", 10.0), ("IAU", 50.0)]:
         try:
-            raw = _stooq_fetch(sym, days=config.data_days)
+            raw = yf.download(sym, period="2y", interval="1d",
+                              auto_adjust=True, progress=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            raw = raw[["Open", "High", "Low", "Close", "Volume"]].copy().dropna()
+            if len(raw) >= config.lookback_required:
+                if mult != 1.0:
+                    for col in ["Open", "High", "Low", "Close"]:
+                        raw[col] = raw[col] * mult
+                df = raw
+                print(f"  [DATA] yfinance:{sym}"
+                      + (f" ×{mult}" if mult != 1.0 else "")
+                      + f" — {len(raw)} rows "
+                      f"({raw.index[0].date()} → {raw.index[-1].date()})")
+                break
+        except Exception as e:
+            print(f"  [WARN] yfinance {sym}: {e}")
+
+    # ─── Stooq gc.f fallback (บางครั้งยังใช้ได้) ─────────────────────────────
+    if df is None:
+        try:
+            raw = _stooq_fetch("gc.f", days=config.data_days)
             if "Volume" not in raw.columns:
                 raw["Volume"] = 0
             raw = raw[["Open", "High", "Low", "Close", "Volume"]]
             if len(raw) >= config.lookback_required:
                 df = raw
-                print(f"  [DATA] Stooq:{sym} — {len(raw)} rows "
-                      f"({raw.index[0].date()} → {raw.index[-1].date()})")
-                break
+                print(f"  [DATA] Stooq:gc.f — {len(raw)} rows")
         except Exception as e:
-            print(f"  [WARN] Stooq {sym}: {e}")
-
-    # ─── yfinance fallback ────────────────────────────────────────────────────
-    if df is None:
-        for sym, mult in [("GC=F", 1.0), ("GLD", 10.0), ("IAU", 50.0)]:
-            try:
-                raw = yf.download(sym, period="2y", interval="1d",
-                                  auto_adjust=True, progress=False)
-                if isinstance(raw.columns, pd.MultiIndex):
-                    raw.columns = raw.columns.get_level_values(0)
-                raw = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
-                if len(raw) >= config.lookback_required:
-                    for col in ["Open", "High", "Low", "Close"]:
-                        raw[col] = raw[col] * mult
-                    df = raw
-                    print(f"  [DATA] yfinance:{sym} ×{mult} — {len(raw)} rows")
-                    break
-            except Exception as e:
-                print(f"  [WARN] yfinance {sym}: {e}")
+            print(f"  [WARN] Stooq gc.f: {e}")
 
     if df is None or len(df) == 0:
         raise RuntimeError("ดึงข้อมูลราคาทองไม่ได้จากทุกแหล่ง — ตรวจสอบการเชื่อมต่อ")

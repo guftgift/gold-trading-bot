@@ -69,18 +69,35 @@ st.markdown("""
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_live_price() -> dict:
-    """ดึงราคา XAU/USD ล่าสุด — cache 60 วินาที"""
-    try:
-        from gold_simulation import _stooq_fetch, SimConfig
-        df = _stooq_fetch("xauusd", days=5)
-        price = float(df["Close"].iloc[-1])
-        prev  = float(df["Close"].iloc[-2]) if len(df) >= 2 else price
-        chg   = price - prev
-        chg_p = chg / prev * 100
-        ts    = df.index[-1].strftime("%Y-%m-%d")
-        return {"price": price, "change": chg, "change_pct": chg_p, "date": ts, "ok": True}
-    except Exception:
-        return {"price": 0, "change": 0, "change_pct": 0, "date": "—", "ok": False}
+    """
+    ดึงราคา XAU/USD ล่าสุด — cache 60 วินาที
+    Fallback: yfinance GC=F → yfinance GLD×10 → yfinance IAU×50
+    (Stooq ถูกลบออกเพราะต้องการ API key แล้ว)
+    """
+    import yfinance as yf
+
+    for sym, mult in [("GC=F", 1.0), ("GLD", 10.0), ("IAU", 50.0)]:
+        try:
+            raw = yf.download(sym, period="5d", interval="1d",
+                              auto_adjust=True, progress=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            closes = raw["Close"].dropna() * mult
+            if len(closes) < 1:
+                continue
+            price = float(closes.iloc[-1])
+            prev  = float(closes.iloc[-2]) if len(closes) >= 2 else price
+            chg   = price - prev
+            chg_p = chg / prev * 100
+            ts    = closes.index[-1].strftime("%Y-%m-%d")
+            return {
+                "price": price, "change": chg, "change_pct": chg_p,
+                "date": ts, "source": sym, "ok": True,
+            }
+        except Exception:
+            continue
+
+    return {"price": 0, "change": 0, "change_pct": 0, "date": "—", "source": "—", "ok": False}
 
 
 @st.cache_data(ttl=3600, show_spinner="Fetching XAU/USD history...")
