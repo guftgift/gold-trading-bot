@@ -22,6 +22,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import requests
+import threading
+import time as _time_mod
 
 from gold_simulation import (
     SimConfig,
@@ -33,8 +35,67 @@ from gold_simulation import (
     run_walk_forward,
     run_monte_carlo,
 )
+from live_monitor import run_check, load_state, save_state, portfolio_value, total_return_pct
 
 TRADES_FILE = Path(__file__).parent / "trades.json"
+
+# ─── Background Monitor Thread (module-level — persists across Streamlit reruns) ───
+_monitor_lock   = threading.Lock()
+_monitor_thread: threading.Thread | None = None
+_monitor_stop   = threading.Event()
+_monitor_meta: dict = {
+    "running":    False,
+    "last_check": None,
+    "next_check": None,
+    "error":      None,
+    "interval":   60,
+}
+
+
+def _monitor_loop(interval_min: int) -> None:
+    """Background thread: ตรวจสัญญาณทุก interval_min นาที แล้วเขียน trades.json"""
+    _monitor_meta["running"] = True
+    state = load_state()
+    while not _monitor_stop.is_set():
+        try:
+            state = run_check(state)
+            _monitor_meta["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _monitor_meta["error"]      = None
+        except Exception as exc:
+            _monitor_meta["error"] = str(exc)
+        next_dt = datetime.now() + timedelta(minutes=interval_min)
+        _monitor_meta["next_check"] = next_dt.strftime("%Y-%m-%d %H:%M:%S")
+        _monitor_stop.wait(timeout=interval_min * 60)
+    _monitor_meta["running"] = False
+
+
+def start_monitor(interval_min: int = 60) -> None:
+    global _monitor_thread
+    with _monitor_lock:
+        if _monitor_thread and _monitor_thread.is_alive():
+            return
+        _monitor_stop.clear()
+        _monitor_meta["interval"] = interval_min
+        _monitor_thread = threading.Thread(
+            target=_monitor_loop, args=(interval_min,),
+            daemon=True, name="gold-monitor",
+        )
+        _monitor_thread.start()
+
+
+def stop_monitor() -> None:
+    _monitor_stop.set()
+    _monitor_meta["running"] = False
+
+
+def is_monitor_running() -> bool:
+    return _monitor_thread is not None and _monitor_thread.is_alive()
+
+
+def check_now_once() -> None:
+    """รันตรวจสัญญาณ 1 ครั้งทันที (blocking ~10 วินาที)"""
+    state = load_state()
+    run_check(state)
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  PAGE CONFIG
@@ -251,6 +312,61 @@ with tab_live:
         _time.sleep(refresh_interval)
         st.rerun()
 
+    # ── Monitor Control Panel ─────────────────────────────────────────────────
+    running = is_monitor_running()
+    st.markdown("#### 🎛️ Monitor Control")
+    cc1, cc2, cc3, cc4, cc5 = st.columns([1, 1, 1, 1, 2])
+
+    check_interval_min = cc5.selectbox(
+        "Check interval (min)", [15, 30, 60, 120, 240], index=2,
+        key="monitor_interval",
+    )
+
+    if cc1.button("▶ Start", type="primary", disabled=running, use_container_width=True):
+        start_monitor(interval_min=check_interval_min)
+        st.success(f"Monitor started — ตรวจทุก {check_interval_min} นาที")
+        _time_mod.sleep(0.3)
+        st.rerun()
+
+    if cc2.button("⏹ Stop", disabled=not running, use_container_width=True):
+        stop_monitor()
+        st.info("Monitor กำลังหยุด...")
+        _time_mod.sleep(0.5)
+        st.rerun()
+
+    if cc3.button("⚡ Check Now", use_container_width=True):
+        with st.spinner("กำลังตรวจสัญญาณ..."):
+            try:
+                check_now_once()
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"Error: {e}")
+        st.rerun()
+
+    if cc4.button("🔄 Refresh", key="refresh_live_monitor", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    # Monitor status badge
+    if running:
+        status_html = (
+            f'<span style="color:#a6e3a1;font-weight:700">● RUNNING</span>'
+            f' &nbsp; ตรวจทุก {_monitor_meta["interval"]} นาที'
+            f' &nbsp;|&nbsp; Last: {_monitor_meta["last_check"] or "—"}'
+            f' &nbsp;|&nbsp; Next: {_monitor_meta["next_check"] or "—"}'
+        )
+    else:
+        status_html = '<span style="color:#6c7086;font-weight:700">○ STOPPED</span> &nbsp; กด ▶ Start เพื่อเริ่ม'
+    if _monitor_meta.get("error"):
+        status_html += f' &nbsp;|&nbsp; <span style="color:#f38ba8">Error: {_monitor_meta["error"]}</span>'
+
+    st.markdown(
+        f'<div style="background:#181825;border-radius:8px;padding:8px 16px;'
+        f'margin:6px 0 16px 0;font-size:0.9em">{status_html}</div>',
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
     # ── Load trades.json ──────────────────────────────────────────────────────
     @st.cache_data(ttl=10)
     def load_trades_json() -> dict | None:
@@ -259,17 +375,10 @@ with tab_live:
                 return json.load(f)
         return None
 
-    if st.button("🔄 Refresh", key="refresh_live_monitor"):
-        st.cache_data.clear()
-        st.rerun()
-
     trade_state = load_trades_json()
 
     if trade_state is None:
-        st.warning(
-            "ยังไม่มีข้อมูล `trades.json` — รัน live_monitor.py ก่อน:\n\n"
-            "```bash\npython live_monitor.py\n```"
-        )
+        st.info("ยังไม่มีข้อมูล — กด **⚡ Check Now** หรือ **▶ Start** เพื่อเริ่มตรวจสัญญาณ")
     else:
         # ── Current position card ──────────────────────────────────────────────
         lp = trade_state.get("last_price") or 0.0
@@ -426,32 +535,21 @@ with tab_live:
         else:
             st.info("ยังไม่มี trade ถูกบันทึก — รอ BUY signal แรก")
 
-        # ── How to run ─────────────────────────────────────────────────────────
-        with st.expander("🖥️ วิธีรัน live_monitor.py", expanded=False):
+        # ── Alternative: CLI ──────────────────────────────────────────────────
+        with st.expander("🖥️ รันจาก terminal แทน (ทางเลือก)", expanded=False):
             st.markdown("""
-**รันต่อเนื่อง** (loop ไม่หยุด ตรวจทุก 60 นาที):
+Monitor จะรันใน **background thread ของ Streamlit** โดยอัตโนมัติ (กด ▶ Start)
+แต่ถ้าต้องการรันแยก process ก็ทำได้:
+
 ```bash
+# รันต่อเนื่อง
 python live_monitor.py
-```
 
-**รันครั้งเดียว** (สำหรับ cron / GitHub Actions):
-```bash
+# รันครั้งเดียว (GitHub Actions / cron)
 python live_monitor.py --once
-```
 
-**ดู position ปัจจุบัน**:
-```bash
+# ดู status
 python live_monitor.py --status
-```
-
-**ปรับ interval และ RSI ผ่าน env vars**:
-```bash
-CHECK_INTERVAL_MIN=30 RSI_BUY=30 RSI_SELL=70 python live_monitor.py
-```
-
-**Dry run** (ไม่ส่ง Telegram จริง):
-```bash
-DRY_RUN=true python live_monitor.py --once
 ```
             """)
 
