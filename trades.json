@@ -1,0 +1,14 @@
+{
+  "state": "CASH",
+  "cash": 100.0,
+  "oz_held": 0.0,
+  "entry_price": null,
+  "entry_date": null,
+  "entry_cost": 0.0,
+  "trades": [],
+  "last_checked": "2026-04-10T10:14:37",
+  "last_signal": "HOLD",
+  "last_price": 4770.60009765625,
+  "last_rsi": 50.554955885326414,
+  "last_saved": "2026-04-10T10:14:37"
+}
