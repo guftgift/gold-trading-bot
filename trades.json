@@ -6,9 +6,9 @@
   "entry_date": null,
   "entry_cost": 0.0,
   "trades": [],
-  "last_checked": "2026-04-13T07:11:04",
-  "last_signal": "HOLD",
-  "last_price": 4753.10009765625,
-  "last_rsi": 49.74753350368429,
-  "last_saved": "2026-04-13T07:11:04"
+  "last_checked": "2026-04-13T10:53:21",
+  "last_signal": "SELL",
+  "last_price": 4738.10009765625,
+  "last_rsi": 49.05131804540499,
+  "last_saved": "2026-04-13T10:53:21"
 }
