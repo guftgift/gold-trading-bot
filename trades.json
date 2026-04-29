@@ -1,10 +1,10 @@
 {
-  "state": "GOLD",
-  "cash": 0.0,
-  "oz_held": 0.021089297023432554,
-  "entry_price": 4737.0,
-  "entry_date": "2026-04-27T05:17:36",
-  "entry_cost": 99.9,
+  "state": "CASH",
+  "cash": 97.2360950048117,
+  "oz_held": 0.0,
+  "entry_price": null,
+  "entry_date": null,
+  "entry_cost": 0.0,
   "trades": [
     {
       "id": 1,
@@ -14,15 +14,29 @@
       "oz": 0.021089297023432554,
       "cost": 99.9,
       "reason": "RSI=48.6 | MA20=4732 / MA100=4727",
-      "pnl_usd": null,
-      "pnl_pct": null,
-      "duration": null,
-      "balance": 99.9
+      "pnl_usd": -2.663904995188304,
+      "pnl_pct": -2.6665715667550587,
+      "duration": 2,
+      "balance": 99.9,
+      "closed_date": "2026-04-29T05:21:06",
+      "close_price": 4615.2998046875
+    },
+    {
+      "id": 2,
+      "action": "SELL",
+      "date": "2026-04-29T05:21:06",
+      "price": 4615.2998046875,
+      "oz": 0.021089297023432554,
+      "pnl_usd": -2.663904995188304,
+      "pnl_pct": -2.6665715667550587,
+      "duration": 2,
+      "reason": "RSI=42.4 | MA20=4730 / MA100=4735",
+      "balance": 97.2360950048117
     }
   ],
-  "last_checked": "2026-04-28T15:30:14",
-  "last_signal": "HOLD",
-  "last_price": 4584.89990234375,
-  "last_rsi": 40.39801422712424,
-  "last_saved": "2026-04-28T15:30:14"
+  "last_checked": "2026-04-29T05:21:06",
+  "last_signal": "SELL",
+  "last_price": 4615.2998046875,
+  "last_rsi": 42.39547239708156,
+  "last_saved": "2026-04-29T05:21:07"
 }
