@@ -36,12 +36,41 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 DRY_RUN            = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-# ─── หุ้นที่ติดตาม + ราคา Cut Loss ────────────────────────────────────────
-WATCHLIST = [
+# ─── Default Watchlist (ใช้เมื่อไม่ได้ระบุ symbol มา) ──────────────────────
+WATCHLIST_DEFAULT = [
     {"symbol": "INDY",  "name": "iShares MSCI India ETF",          "cut_loss": 39.00},
     {"symbol": "UNH",   "name": "UnitedHealth Group",               "cut_loss": 250.00},
     {"symbol": "XLF",   "name": "Financial Select Sector SPDR ETF", "cut_loss": 46.50},
 ]
+
+
+def build_watchlist(cli_symbols: list[str] | None = None) -> list[dict]:
+    """
+    สร้าง watchlist จาก (เรียงตาม priority):
+      1. CLI args : python stock_alert_bot.py AAPL TSLA NVDA
+      2. Env var  : WATCHLIST_STOCKS=AAPL,MSFT,NVDA  (GitHub Actions variable)
+      3. Default  : WATCHLIST_DEFAULT
+
+    symbol ที่ไม่ระบุ cut_loss จะถูกคำนวณอัตโนมัติ (ATR×2)
+    """
+    if cli_symbols:
+        return [{"symbol": s.upper(), "name": "", "cut_loss": 0.0} for s in cli_symbols if s]
+
+    raw = os.environ.get("WATCHLIST_STOCKS", "").strip()
+    if raw:
+        return [{"symbol": s.strip().upper(), "name": "", "cut_loss": 0.0}
+                for s in raw.split(",") if s.strip()]
+
+    return WATCHLIST_DEFAULT
+
+
+def get_stock_name(symbol: str) -> str:
+    """ดึงชื่อบริษัทจาก yfinance (fallback = symbol)"""
+    try:
+        info = yf.Ticker(symbol).info
+        return info.get("longName") or info.get("shortName") or symbol
+    except Exception:
+        return symbol
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -128,6 +157,12 @@ def get_technical_signal(df: pd.DataFrame, cut_loss: float) -> dict:
     volume     = float(latest["Volume"])
     vol_ma     = float(latest["VOL_MA20"])
 
+    # ── Auto-calculate Cut Loss (ATR×2) ──────────────────────────────────────
+    auto_cut_loss = (cut_loss == 0.0)
+    if auto_cut_loss:
+        # ATR×2 below current price, floor = MA50×0.97 (support buffer)
+        cut_loss = round(max(price - 2 * atr, ma50 * 0.97), 2)
+
     score      = 0
     breakdown  = []
 
@@ -213,6 +248,7 @@ def get_technical_signal(df: pd.DataFrame, cut_loss: float) -> dict:
         "cut_loss_hit":       cut_loss_hit,
         "cut_loss_pct":       cut_loss_pct,
         "cut_loss_distance":  cut_loss_distance,
+        "auto_cut_loss":      auto_cut_loss,
         "score":              score,
         "breakdown":          breakdown,
     }
@@ -432,6 +468,7 @@ def build_stock_block(stock: dict, tech: dict, sentiment: dict,
     ma20       = tech["ma20"]
     ma50       = tech["ma50"]
     atr        = tech["atr"]
+    cl_tag     = " 🤖ATR×2" if tech.get("auto_cut_loss") else ""
 
     # Distance from cut loss
     if tech["cut_loss_hit"]:
@@ -466,7 +503,7 @@ def build_stock_block(stock: dict, tech: dict, sentiment: dict,
     block = (
         f"{'━'*35}\n"
         f"<b>{esc(stock['symbol'])}</b>  <i>{esc(stock['name'])}</i>\n"
-        f"💵 ราคา   : <b>${price:.2f}</b>  (Cut Loss: ${cut_loss:.2f})\n"
+        f"💵 ราคา   : <b>${price:.2f}</b>  (Cut Loss: ${cut_loss:.2f}{esc(cl_tag)})\n"
         f"🛡 Status  : {cl_str}\n"
         f"📊 RSI     : {rsi:.0f}  {rsi_label}\n"
         f"📈 MA      : MA20 ${ma20:.2f}  |  MA50 ${ma50:.2f}\n"
@@ -522,14 +559,21 @@ def build_full_message(results: list) -> str:
 #  6. MAIN
 # ════════════════════════════════════════════════════════════════════════════
 
-def run_stock_bot():
+def run_stock_bot(cli_symbols: list[str] | None = None):
     print(f"\n{'═'*60}")
     print(f"  📈 Stock Alert Bot — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     print(f"{'═'*60}")
 
+    watchlist = build_watchlist(cli_symbols)
+    print(f"  📋 Watchlist: {', '.join(s['symbol'] for s in watchlist)}")
+
     results = []
 
-    for stock in WATCHLIST:
+    for stock in watchlist:
+        # Auto-lookup ชื่อบริษัทถ้าไม่ได้ระบุมา
+        if not stock["name"]:
+            stock["name"] = get_stock_name(stock["symbol"])
+            print(f"   🔍 {stock['symbol']} → {stock['name']}")
         sym  = stock["symbol"]
         print(f"\n── {sym} ──────────────────────────────────────")
 
@@ -576,4 +620,6 @@ def run_stock_bot():
 
 
 if __name__ == "__main__":
-    run_stock_bot()
+    import sys
+    cli_syms = sys.argv[1:] if len(sys.argv) > 1 else None
+    run_stock_bot(cli_symbols=cli_syms)

@@ -8,6 +8,10 @@ on:
   # ─── รันมือได้ทันที ───────────────────────────────────────────────────────
   workflow_dispatch:
     inputs:
+      symbols:
+        description: 'หุ้นที่ต้องการดู เช่น AAPL,TSLA,NVDA (เว้นว่าง = ใช้ค่าเริ่มต้น)'
+        required: false
+        default: ''
       dry_run:
         description: 'Dry Run (ไม่ส่ง Telegram จริง)'
         required: false
@@ -41,6 +45,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
+          WATCHLIST_STOCKS:   ${{ github.event.inputs.symbols }}
         run: python stock_alert_bot.py
 
       - name: 📋 Show error log (on failure)
