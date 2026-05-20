@@ -467,7 +467,7 @@ def run_once() -> None:
     """รันครั้งเดียว (สำหรับ GitHub Actions / cron)"""
     log.info("Running single check (--once mode)")
     state = load_state()
-    state = run_check(state)
+    state = run_check(state, send_hold_alert=True)
     print_status(state)
 
 
