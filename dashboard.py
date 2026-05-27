@@ -171,6 +171,9 @@ with st.sidebar:
     ma_trend = st.selectbox("MA Trend", [100, 150, 200, 250], index=[100,150,200,250].index(MA_TREND) if MA_TREND in [100,150,200,250] else 2)
 
     st.divider()
+    show_thb = st.toggle("💱 แสดงราคาเป็น ฿ THB", value=True)
+
+    st.divider()
     send_hold_ui = st.toggle("ส่ง HOLD ทาง Telegram ด้วย", value=False)
 
     st.divider()
@@ -178,6 +181,38 @@ with st.sidebar:
 
     st.divider()
     check_interval = st.selectbox("ตรวจทุก (นาที)", [15, 30, 60, 120, 240], index=2)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  EXCHANGE RATE  USD → THB
+# ═════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_usdthb() -> float:
+    """ดึงอัตราแลกเปลี่ยน USD/THB — cache 1 ชั่วโมง"""
+    import yfinance as yf, requests as _req
+
+    # 1) yfinance
+    try:
+        raw = yf.download("USDTHB=X", period="5d", auto_adjust=True, progress=False)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        rate = float(raw["Close"].dropna().iloc[-1])
+        if 25 < rate < 60:
+            return rate
+    except Exception:
+        pass
+
+    # 2) frankfurter.app (ฟรี ไม่ต้อง API key)
+    try:
+        r = _req.get("https://api.frankfurter.app/latest?from=USD&to=THB", timeout=5)
+        rate = float(r.json()["rates"]["THB"])
+        if 25 < rate < 60:
+            return rate
+    except Exception:
+        pass
+
+    return 34.0   # fallback
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -288,19 +323,31 @@ with tab_signal:
 
     st.divider()
 
+    # ── Exchange rate ─────────────────────────────────────────────────────────
+    fx = get_usdthb() if show_thb else 1.0
+    sym     = "฿" if show_thb else "$"
+    cur_lbl = "THB" if show_thb else "USD"
+
+    def fmt_price(usd_val: float, decimals: int = 2) -> str:
+        v = usd_val * fx
+        return f"{sym}{v:,.{decimals}f}"
+
+    if show_thb:
+        st.caption(f"💱 อัตราแลกเปลี่ยน USD/THB = **{fx:.2f}** (อัปเดตทุก 1 ชม.)")
+
     # ── Load latest signal from signals.json ──────────────────────────────────
     sig_state = load_signals_json()
 
     # ── Current signal card ───────────────────────────────────────────────────
     if sig_state:
-        sig   = sig_state.get("last_signal", "—")
-        price = sig_state.get("last_price") or 0
-        rsi_v = sig_state.get("last_rsi") or 0
-        ma_fv = sig_state.get("last_ma_fast") or 0
-        ma_sv = sig_state.get("last_ma_slow") or 0
-        ma_tv = sig_state.get("last_ma_trend") or 0
-        chk   = sig_state.get("last_checked", "—")
-        algo  = sig_state.get("algorithm_used", "—")
+        sig    = sig_state.get("last_signal", "—")
+        price  = sig_state.get("last_price") or 0
+        rsi_v  = sig_state.get("last_rsi") or 0
+        ma_fv  = sig_state.get("last_ma_fast") or 0
+        ma_sv  = sig_state.get("last_ma_slow") or 0
+        ma_tv  = sig_state.get("last_ma_trend") or 0
+        chk    = sig_state.get("last_checked", "—")
+        algo   = sig_state.get("algorithm_used", "—")
         reason = sig_state.get("signal_reason", "—")
 
         colors = {"BUY": "#a6e3a1", "SELL": "#f38ba8", "HOLD": "#89b4fa"}
@@ -314,7 +361,8 @@ with tab_signal:
           <span style="font-size:2em;font-weight:800;color:{c}">{ic} {sig}</span>
           &nbsp;&nbsp;
           <span style="color:#cdd6f4;font-size:1.1em">XAU/USD &nbsp;|&nbsp;
-            <b>${price:,.2f}</b>
+            <b>{fmt_price(price)}</b>
+            {'&nbsp;<span style="color:#6c7086;font-size:0.75em">($'+f"{price:,.2f}"+')</span>' if show_thb else ''}
           </span><br>
           <span style="color:#6c7086;font-size:0.88em">
             ตรวจล่าสุด: {chk} &nbsp;|&nbsp; Algorithm: <b style="color:{c}">{algo}</b>
@@ -324,12 +372,12 @@ with tab_signal:
 
         # Key metrics
         km1, km2, km3, km4, km5 = st.columns(5)
-        km1.metric("XAU/USD",       f"${price:,.2f}")
+        km1.metric(f"XAU/USD ({cur_lbl})", fmt_price(price))
         km2.metric(f"RSI({rsi_buy}/<{rsi_sell})", f"{rsi_v:.1f}",
                    "Oversold" if rsi_v < rsi_buy else ("Overbought" if rsi_v > rsi_sell else "Neutral"))
-        km3.metric(f"MA{ma_fast}",  f"{ma_fv:,.0f}")
-        km4.metric(f"MA{ma_slow}",  f"{ma_sv:,.0f}")
-        km5.metric(f"MA{ma_trend}", f"{ma_tv:,.0f}")
+        km3.metric(f"MA{ma_fast} ({cur_lbl})",  fmt_price(ma_fv, 0))
+        km4.metric(f"MA{ma_slow} ({cur_lbl})",  fmt_price(ma_sv, 0))
+        km5.metric(f"MA{ma_trend} ({cur_lbl})", fmt_price(ma_tv, 0))
     else:
         st.info("กด **⚡ Check Now** หรือ **▶ Start Monitor** เพื่อดูสัญญาณ")
         sig = None
@@ -337,7 +385,8 @@ with tab_signal:
     st.divider()
 
     # ── Chart ─────────────────────────────────────────────────────────────────
-    st.subheader("📈 Chart — XAU/USD + Indicators")
+    chart_title = f"XAU/USD — ราคาทองคำ ({cur_lbl})"
+    st.subheader(f"📈 {chart_title}")
 
     with st.spinner("Loading chart data…"):
         try:
@@ -348,12 +397,21 @@ with tab_signal:
             df = None
 
     if df is not None and len(df) > 0:
+        # แปลงราคาใน DataFrame → THB ถ้าเปิด toggle
+        df_plot = df.copy()
+        price_cols = ["Close", f"MA{ma_fast}", f"MA{ma_slow}", f"MA{ma_trend}"]
+        for col in price_cols:
+            if col in df_plot.columns:
+                df_plot[col] = df_plot[col] * fx
+
         # ── BUY/SELL markers จาก signal history ──────────────────────────────
         hist = (sig_state or {}).get("history", [])
-        buy_dates  = [h["date"][:10] for h in hist if h["signal"] == "BUY"]
-        sell_dates = [h["date"][:10] for h in hist if h["signal"] == "SELL"]
-        buy_prices  = [h["price"] for h in hist if h["signal"] == "BUY"]
-        sell_prices = [h["price"] for h in hist if h["signal"] == "SELL"]
+        buy_dates   = [h["date"][:10] for h in hist if h["signal"] == "BUY"]
+        sell_dates  = [h["date"][:10] for h in hist if h["signal"] == "SELL"]
+        buy_prices  = [h["price"] * fx for h in hist if h["signal"] == "BUY"]
+        sell_prices = [h["price"] * fx for h in hist if h["signal"] == "SELL"]
+
+        y_label = f"ราคา ({sym})"
 
         # ── 2-panel chart ─────────────────────────────────────────────────────
         fig = make_subplots(
@@ -361,25 +419,32 @@ with tab_signal:
             shared_xaxes=True,
             row_heights=[0.7, 0.3],
             vertical_spacing=0.04,
-            subplot_titles=("XAU/USD Price + Moving Averages", f"RSI({rsi_buy}/{rsi_sell})"),
+            subplot_titles=(
+                f"ราคาทองคำ + Moving Averages ({cur_lbl})",
+                f"RSI({rsi_buy}/{rsi_sell})",
+            ),
         )
 
         # Panel 1: Price
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["Close"],
-            name="XAU/USD", line=dict(color="#f9e2af", width=1.8),
+            x=df_plot.index, y=df_plot["Close"],
+            name=f"XAU/USD ({cur_lbl})",
+            line=dict(color="#f9e2af", width=1.8),
+            hovertemplate=f"{sym}%{{y:,.0f}}<extra></extra>",
         ), row=1, col=1)
 
         ma_colors = {
-            f"MA{ma_fast}":  "#89b4fa",   # blue
-            f"MA{ma_slow}":  "#fab387",   # orange
-            f"MA{ma_trend}": "#f38ba8",   # red
+            f"MA{ma_fast}":  "#89b4fa",
+            f"MA{ma_slow}":  "#fab387",
+            f"MA{ma_trend}": "#f38ba8",
         }
         for col_name, color in ma_colors.items():
-            if col_name in df.columns:
+            if col_name in df_plot.columns:
                 fig.add_trace(go.Scatter(
-                    x=df.index, y=df[col_name],
-                    name=col_name, line=dict(color=color, width=1.2, dash="dot"),
+                    x=df_plot.index, y=df_plot[col_name],
+                    name=col_name,
+                    line=dict(color=color, width=1.2, dash="dot"),
+                    hovertemplate=f"{sym}%{{y:,.0f}}<extra>{col_name}</extra>",
                 ), row=1, col=1)
 
         # BUY markers
@@ -390,6 +455,7 @@ with tab_signal:
                 mode="markers",
                 marker=dict(symbol="triangle-up", size=14, color="#a6e3a1",
                             line=dict(color="#1e1e2e", width=1)),
+                hovertemplate=f"BUY<br>{sym}%{{y:,.0f}}<extra></extra>",
             ), row=1, col=1)
 
         # SELL markers
@@ -400,13 +466,15 @@ with tab_signal:
                 mode="markers",
                 marker=dict(symbol="triangle-down", size=14, color="#f38ba8",
                             line=dict(color="#1e1e2e", width=1)),
+                hovertemplate=f"SELL<br>{sym}%{{y:,.0f}}<extra></extra>",
             ), row=1, col=1)
 
-        # Panel 2: RSI
-        if "RSI" in df.columns:
+        # Panel 2: RSI (ไม่แปลง fx — RSI ไม่มีหน่วยเงิน)
+        if "RSI" in df_plot.columns:
             fig.add_trace(go.Scatter(
-                x=df.index, y=df["RSI"],
+                x=df_plot.index, y=df_plot["RSI"],
                 name="RSI", line=dict(color="#cba6f7", width=1.5),
+                hovertemplate="RSI: %{y:.1f}<extra></extra>",
             ), row=2, col=1)
 
             # Oversold / Overbought zones
@@ -433,7 +501,8 @@ with tab_signal:
             margin=dict(t=60, b=20, l=0, r=0),
             hovermode="x unified",
             xaxis=dict(rangeslider=dict(visible=False), gridcolor="#313244"),
-            yaxis=dict(gridcolor="#313244"),
+            yaxis=dict(title=y_label, gridcolor="#313244",
+                       tickprefix=sym, tickformat=",.0f"),
             xaxis2=dict(gridcolor="#313244"),
             yaxis2=dict(gridcolor="#313244", range=[0, 100]),
         )
@@ -512,9 +581,9 @@ with tab_signal:
               <div style="color:{ma_col};font-size:1em;font-weight:600">{ma_status}</div>
               <hr style="border-color:#31324466;margin:10px 0">
               <div style="color:#6c7086;font-size:0.85em">
-                MA{ma_fast}={ma_fv:,.0f} &nbsp;/&nbsp;
-                MA{ma_slow}={ma_sv:,.0f} &nbsp;/&nbsp;
-                MA{ma_trend}={ma_tv:,.0f}<br>
+                MA{ma_fast}={fmt_price(ma_fv,0)} &nbsp;/&nbsp;
+                MA{ma_slow}={fmt_price(ma_sv,0)} &nbsp;/&nbsp;
+                MA{ma_trend}={fmt_price(ma_tv,0)}<br>
                 MA{ma_fast} ข้ามขึ้นเหนือ MA{ma_slow} + ราคา &gt; MA{ma_trend} → <b>BUY</b><br>
                 MA{ma_fast} ข้ามลงใต้ MA{ma_slow} → <b>SELL</b><br>
                 (RSI wins ถ้า RSI มีสัญญาณด้วย)
@@ -578,20 +647,25 @@ with tab_history:
         st.caption(f"แสดง {len(filtered)} รายการ จาก {len(hist)} ทั้งหมด")
 
         if filtered:
+            price_col_label = f"Price ({cur_lbl})"
             rows = []
             for h in reversed(filtered):
-                sig_h = h.get("signal", "—")
+                sig_h  = h.get("signal", "—")
                 icon_h = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(sig_h, "")
+                p      = h.get("price", 0) * fx
+                mf     = h.get("ma_fast",  0) * fx
+                ms     = h.get("ma_slow",  0) * fx
+                mt     = h.get("ma_trend", 0) * fx
                 rows.append({
-                    "Date":       str(h.get("date", ""))[:19].replace("T", " "),
-                    "Signal":     f"{icon_h} {sig_h}",
-                    "Price ($)":  f"${h.get('price', 0):,.2f}",
-                    "RSI":        f"{h.get('rsi', 0):.1f}",
-                    f"MA{ma_fast}":  f"{h.get('ma_fast', 0):,.0f}",
-                    f"MA{ma_slow}":  f"{h.get('ma_slow', 0):,.0f}",
-                    f"MA{ma_trend}": f"{h.get('ma_trend', 0):,.0f}",
-                    "Algorithm":  h.get("algorithm", "—"),
-                    "Reason":     h.get("reason", ""),
+                    "Date":             str(h.get("date", ""))[:19].replace("T", " "),
+                    "Signal":           f"{icon_h} {sig_h}",
+                    price_col_label:    f"{sym}{p:,.0f}",
+                    "RSI":              f"{h.get('rsi', 0):.1f}",
+                    f"MA{ma_fast}":     f"{sym}{mf:,.0f}",
+                    f"MA{ma_slow}":     f"{sym}{ms:,.0f}",
+                    f"MA{ma_trend}":    f"{sym}{mt:,.0f}",
+                    "Algorithm":        h.get("algorithm", "—"),
+                    "Reason":           h.get("reason", ""),
                 })
 
             hist_df = pd.DataFrame(rows)
@@ -615,20 +689,21 @@ with tab_history:
             non_hold_h = [h for h in filtered if h.get("signal") in ("BUY", "SELL")]
             if len(non_hold_h) >= 1:
                 tl_fig = go.Figure()
-                for sig_type, color, symbol in [
+                for sig_type, color, mkr_sym in [
                     ("BUY",  "#a6e3a1", "triangle-up"),
                     ("SELL", "#f38ba8", "triangle-down"),
                 ]:
                     pts = [h for h in non_hold_h if h.get("signal") == sig_type]
                     if pts:
                         tl_fig.add_trace(go.Scatter(
-                            x=[p["date"][:10] for p in pts],
-                            y=[p["price"]     for p in pts],
+                            x=[p["date"][:10]      for p in pts],
+                            y=[p["price"] * fx     for p in pts],
                             name=sig_type,
                             mode="markers+text",
                             text=[sig_type] * len(pts),
                             textposition="top center",
-                            marker=dict(symbol=symbol, size=14, color=color),
+                            marker=dict(symbol=mkr_sym, size=14, color=color),
+                            hovertemplate=f"{sig_type}<br>{sym}%{{y:,.0f}}<extra></extra>",
                         ))
 
                 tl_fig.update_layout(
@@ -636,7 +711,8 @@ with tab_history:
                     paper_bgcolor="#1e1e2e", plot_bgcolor="#1e1e2e",
                     margin=dict(t=10, b=20, l=0, r=0),
                     showlegend=True,
-                    yaxis=dict(title="Price ($)", gridcolor="#313244"),
+                    yaxis=dict(title=f"Price ({cur_lbl})", gridcolor="#313244",
+                               tickprefix=sym, tickformat=",.0f"),
                     xaxis=dict(gridcolor="#313244"),
                 )
                 st.plotly_chart(tl_fig, use_container_width=True)
