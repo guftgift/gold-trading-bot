@@ -22,3 +22,4 @@ env/
 
 # Streamlit — block real secrets, allow config & example
 .streamlit/secrets.toml
+dry_run_chart.png
