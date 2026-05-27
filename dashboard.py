@@ -39,33 +39,49 @@ from live_monitor import run_check, load_state, save_state, portfolio_value, tot
 
 TRADES_FILE = Path(__file__).parent / "trades.json"
 
-# ─── Background Monitor Thread (module-level — persists across Streamlit reruns) ───
+# ─── Background Monitor Thread ────────────────────────────────────────────────
+# Module-level variables — persist across Streamlit reruns (same process)
 _monitor_lock   = threading.Lock()
 _monitor_thread: threading.Thread | None = None
 _monitor_stop   = threading.Event()
 _monitor_meta: dict = {
-    "running":    False,
-    "last_check": None,
-    "next_check": None,
-    "error":      None,
-    "interval":   60,
+    "running":      False,
+    "last_check":   None,
+    "next_check":   None,
+    "error":        None,
+    "interval":     60,
+    "should_run":   True,   # ← intent flag: True = user wants it running
+    "restart_count": 0,
 }
+_RETRY_DELAY_SEC = 60   # รอ 60 วิ แล้ว retry ถ้า check พัง
 
 
 def _monitor_loop(interval_min: int) -> None:
-    """Background thread: ตรวจสัญญาณทุก interval_min นาที แล้วเขียน trades.json"""
+    """
+    Background thread: ตรวจสัญญาณทุก interval_min นาที
+    - Exception ใน run_check → log error + retry อีก _RETRY_DELAY_SEC วิ (ไม่หยุด)
+    - ออกเมื่อ _monitor_stop set เท่านั้น
+    """
     _monitor_meta["running"] = True
     state = load_state()
+
     while not _monitor_stop.is_set():
         try:
             state = run_check(state)
             _monitor_meta["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _monitor_meta["error"]      = None
+            # รอตามปกติ
+            next_dt = datetime.now() + timedelta(minutes=interval_min)
+            _monitor_meta["next_check"] = next_dt.strftime("%Y-%m-%d %H:%M:%S")
+            _monitor_stop.wait(timeout=interval_min * 60)
+
         except Exception as exc:
-            _monitor_meta["error"] = str(exc)
-        next_dt = datetime.now() + timedelta(minutes=interval_min)
-        _monitor_meta["next_check"] = next_dt.strftime("%Y-%m-%d %H:%M:%S")
-        _monitor_stop.wait(timeout=interval_min * 60)
+            _monitor_meta["error"] = f"{type(exc).__name__}: {exc}"
+            # retry เร็วขึ้น แทนที่จะรอเต็ม interval
+            next_dt = datetime.now() + timedelta(seconds=_RETRY_DELAY_SEC)
+            _monitor_meta["next_check"] = next_dt.strftime("%Y-%m-%d %H:%M:%S") + " (retry)"
+            _monitor_stop.wait(timeout=_RETRY_DELAY_SEC)
+
     _monitor_meta["running"] = False
 
 
@@ -73,9 +89,11 @@ def start_monitor(interval_min: int = 60) -> None:
     global _monitor_thread
     with _monitor_lock:
         if _monitor_thread and _monitor_thread.is_alive():
-            return
+            return  # already running
         _monitor_stop.clear()
-        _monitor_meta["interval"] = interval_min
+        _monitor_meta["interval"]    = interval_min
+        _monitor_meta["should_run"]  = True
+        _monitor_meta["restart_count"] += 1
         _monitor_thread = threading.Thread(
             target=_monitor_loop, args=(interval_min,),
             daemon=True, name="gold-monitor",
@@ -84,6 +102,7 @@ def start_monitor(interval_min: int = 60) -> None:
 
 
 def stop_monitor() -> None:
+    _monitor_meta["should_run"] = False
     _monitor_stop.set()
     _monitor_meta["running"] = False
 
@@ -92,10 +111,27 @@ def is_monitor_running() -> bool:
     return _monitor_thread is not None and _monitor_thread.is_alive()
 
 
+def _watchdog() -> bool:
+    """
+    เรียกทุก Streamlit rerun — ถ้า thread ตายแต่ user ยังต้องการให้รัน → restart อัตโนมัติ
+    Returns True ถ้าเพิ่ง restart
+    """
+    if _monitor_meta["should_run"] and not is_monitor_running():
+        start_monitor(interval_min=_monitor_meta["interval"])
+        return True
+    return False
+
+
 def check_now_once() -> None:
     """รันตรวจสัญญาณ 1 ครั้งทันที (blocking ~10 วินาที)"""
     state = load_state()
     run_check(state)
+
+
+# ─── Auto-start on app load ───────────────────────────────────────────────────
+# เริ่ม thread ทันทีที่ app โหลด (ครั้งแรก) โดยไม่ต้องรอกด Start
+if not is_monitor_running() and _monitor_meta["should_run"]:
+    start_monitor(interval_min=_monitor_meta["interval"])
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  PAGE CONFIG
@@ -294,11 +330,14 @@ tab_live, tab_sim = st.tabs(["📡 Live Monitor", "🔬 Backtest Simulation"])
 # ═════════════════════════════════════════════════════════════════════════════
 
 with tab_live:
+    # ── Watchdog: restart thread อัตโนมัติถ้าตายแต่ควรรัน ─────────────────────
+    _just_restarted = _watchdog()
+
     # ── Auto-refresh countdown ────────────────────────────────────────────────
     lm_col1, lm_col2, lm_col3 = st.columns([3, 1, 1])
     with lm_col1:
         st.subheader("📡 Live Signal Monitor")
-        st.caption("ตรวจสัญญาณ XAU/USD แบบ real-time | อ่านจาก trades.json ที่ live_monitor.py อัปเดต")
+        st.caption("ตรวจสัญญาณ XAU/USD แบบ real-time | thread รันใน background อัตโนมัติ")
     with lm_col2:
         auto_refresh = st.toggle("Auto-refresh", value=False)
     with lm_col3:
@@ -306,11 +345,12 @@ with tab_live:
                                         label_visibility="collapsed")
 
     if auto_refresh:
-        st.info(f"🔄 Auto-refresh ทุก {refresh_interval} วินาที — หน้าจะรีโหลดอัตโนมัติ")
-        time_ph = st.empty()
-        import time as _time
-        _time.sleep(refresh_interval)
+        st.info(f"🔄 Auto-refresh ทุก {refresh_interval} วินาที")
+        _time_mod.sleep(refresh_interval)
         st.rerun()
+
+    if _just_restarted:
+        st.toast("♻️ Monitor thread restarted อัตโนมัติ", icon="♻️")
 
     # ── Monitor Control Panel ─────────────────────────────────────────────────
     running = is_monitor_running()
@@ -348,17 +388,19 @@ with tab_live:
         st.rerun()
 
     # Monitor status badge
+    restarts = _monitor_meta.get("restart_count", 0)
     if running:
         status_html = (
             f'<span style="color:#a6e3a1;font-weight:700">● RUNNING</span>'
             f' &nbsp; ตรวจทุก {_monitor_meta["interval"]} นาที'
-            f' &nbsp;|&nbsp; Last: {_monitor_meta["last_check"] or "—"}'
+            f' &nbsp;|&nbsp; Last: {_monitor_meta["last_check"] or "กำลังตรวจครั้งแรก…"}'
             f' &nbsp;|&nbsp; Next: {_monitor_meta["next_check"] or "—"}'
+            + (f' &nbsp;|&nbsp; Restarts: {restarts}' if restarts > 1 else '')
         )
     else:
-        status_html = '<span style="color:#6c7086;font-weight:700">○ STOPPED</span> &nbsp; กด ▶ Start เพื่อเริ่ม'
+        status_html = '<span style="color:#6c7086;font-weight:700">○ STOPPED</span> &nbsp; (จะ auto-start เมื่อกด ▶ Start ครั้งแรก)'
     if _monitor_meta.get("error"):
-        status_html += f' &nbsp;|&nbsp; <span style="color:#f38ba8">Error: {_monitor_meta["error"]}</span>'
+        status_html += f' &nbsp;|&nbsp; <span style="color:#f38ba8">⚠ {_monitor_meta["error"]} — retrying…</span>'
 
     st.markdown(
         f'<div style="background:#181825;border-radius:8px;padding:8px 16px;'
