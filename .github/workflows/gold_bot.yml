@@ -1,82 +1,84 @@
-name: 🥇 Gold Trading Bot
+name: 🥇 Gold Signal Monitor
+
+# ── เวลา (UTC+7 ไทย) ──────────────────────────────────────────────────────────
+# UTC 02:00 = 09:00 ไทย   UTC 05:00 = 12:00 ไทย
+# UTC 09:00 = 16:00 ไทย   UTC 13:00 = 20:00 ไทย
+#
+# ปรับ schedule ได้ที่ https://crontab.guru
+# format: 'นาที ชั่วโมง วัน เดือน วันในสัปดาห์'
+# 1-5 = จันทร์-ศุกร์ (ตลาดเปิด), * = ทุกวัน
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
-  # ─── รันอัตโนมัติตามตาราง (UTC time) ─────────────────────────────────────
-  # UTC+7 (ไทย): UTC 02 = 09:00, UTC 05 = 12:00, UTC 09 = 16:00, UTC 13 = 20:00
   schedule:
-    - cron: '0 2  * * 1-5'   # 09:00 น. ไทย — จันทร์-ศุกร์
-    - cron: '0 5  * * 1-5'   # 12:00 น. ไทย
-    - cron: '0 9  * * 1-5'   # 16:00 น. ไทย
-    - cron: '0 13 * * 1-5'   # 20:00 น. ไทย (ตลาดนิวยอร์กเปิด)
+    - cron: '0 2  * * 1-5'   # 09:00 ไทย
+    - cron: '0 5  * * 1-5'   # 12:00 ไทย
+    - cron: '0 9  * * 1-5'   # 16:00 ไทย
+    - cron: '0 13 * * 1-5'   # 20:00 ไทย
 
-  # ─── รันมือได้ทันที ──────────────────────────────────────────────────────
+  # กดรันมือได้ใน GitHub Actions → Actions tab → Run workflow
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry Run (ไม่ส่ง Telegram จริง)'
+        description: 'Dry Run — ตรวจสัญญาณแต่ไม่ส่ง Telegram'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      send_hold:
+        description: 'ส่ง HOLD ทาง Telegram ด้วยไหม'
         required: false
         default: 'false'
         type: choice
         options: ['false', 'true']
 
 permissions:
-  contents: write   # อนุญาตให้ commit trades.json กลับเข้า repo
+  contents: write   # สำหรับ commit signals.json กลับเข้า repo
 
 jobs:
   signal-check:
-    name: 📡 Check Gold Signal
+    name: 📡 Gold Signal Check
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      # 1. Checkout (ดึงโค้ด + trades.json ล่าสุดจาก repo)
-      - name: 📥 Checkout repository
+      # 1. ดึงโค้ด + signals.json ล่าสุดจาก repo
+      - name: 📥 Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      # 2. ติดตั้ง Python
-      - name: 🐍 Setup Python 3.11
+      # 2. Python
+      - name: 🐍 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # 3. ติดตั้ง dependencies
+      # 3. ติดตั้งเฉพาะ dependencies ที่จำเป็น (ไม่มี streamlit/plotly)
       - name: 📦 Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements_bot.txt
 
-      # 4. รัน live monitor (--once = ตรวจ 1 รอบแล้วออก)
-      - name: 🤖 Run Live Monitor
+      # 4. ตรวจสัญญาณ → ส่ง Telegram ถ้าเป็น BUY/SELL
+      - name: 🤖 Check Signal
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
+          SEND_HOLD:          ${{ github.event.inputs.send_hold || 'false' }}
         run: python live_monitor.py --once
 
-      # 5. Commit trades.json กลับเข้า repo (เพื่อ persist state ข้าม run)
-      #    [skip ci] ป้องกัน loop trigger
-      - name: 💾 Save trades.json to repo
+      # 5. บันทึก signals.json กลับเข้า repo (persist state ข้าม run)
+      #    [skip ci] ป้องกัน commit นี้ trigger workflow วนซ้ำ
+      - name: 💾 Save signals.json
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add trades.json
+          git add signals.json
           git diff --staged --quiet \
-            && echo "No changes to trades.json — skipping commit" \
-            || git commit -m "chore: update trades.json $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
+            && echo "ℹ️  signals.json ไม่มีการเปลี่ยนแปลง" \
+            || git commit -m "chore: update signals.json $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
           git push
 
-      # 6. แสดง status สรุป
-      - name: 📊 Show status
-        if: always()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python live_monitor.py --status
-
-      # 7. แสดง error log ถ้า fail
-      - name: 📋 Show error log (on failure)
+      # 6. Error log
+      - name: 📋 Error log
         if: failure()
-        run: |
-          echo "❌ Bot run failed — check logs above"
-          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        run: echo "❌ Failed at $(date -u '+%Y-%m-%d %H:%M UTC')"
