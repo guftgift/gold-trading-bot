@@ -1,25 +1,18 @@
 """
-Gold Live Monitor — Continuous Signal Watcher
-==============================================
-ตรวจสัญญาณทองคำแบบ real-time ทุก N นาที
-เมื่อพบ BUY/SELL signal → ส่ง Telegram + บันทึก trades.json
+Gold Signal Monitor — แจ้งสัญญาณ BUY / SELL / HOLD ทาง Telegram
+=================================================================
+ไม่มีการ simulate การลงทุน — แจ้งสัญญาณ + อธิบาย algorithm อย่างเดียว
 
 วิธีรัน:
-  python live_monitor.py             # รันต่อเนื่อง (loop ตลอด)
-  python live_monitor.py --once      # รันครั้งเดียว (สำหรับ cron/GitHub Actions)
-  python live_monitor.py --status    # แสดง position ปัจจุบันแล้วออก
-  DRY_RUN=true python live_monitor.py  # ไม่ส่ง Telegram จริง
+  python live_monitor.py             # รันต่อเนื่อง (loop)
+  python live_monitor.py --once      # รันครั้งเดียว (GitHub Actions / cron)
+  python live_monitor.py --status    # แสดงสัญญาณล่าสุดแล้วออก
+  DRY_RUN=true python live_monitor.py --once
 """
 
-import os
-import sys
-import json
-import time
-import logging
-import argparse
+import os, sys, json, time, logging, argparse
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import requests
@@ -32,404 +25,280 @@ from gold_simulation import (
 )
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID",   "")
-DRY_RUN               = os.environ.get("DRY_RUN", "false").lower() == "true"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "")
+DRY_RUN            = os.environ.get("DRY_RUN", "false").lower() == "true"
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "60"))
+SEND_HOLD          = os.environ.get("SEND_HOLD", "false").lower() == "true"
 
-CHECK_INTERVAL_MIN    = int(os.environ.get("CHECK_INTERVAL_MIN", "60"))   # ตรวจทุก 60 นาที
-INITIAL_CAPITAL       = float(os.environ.get("INITIAL_CAPITAL",  "100"))  # ทุนเริ่มต้น
-TRANSACTION_COST      = float(os.environ.get("TRANSACTION_COST", "0.001")) # 0.1%
+RSI_BUY  = float(os.environ.get("RSI_BUY",  "35"))
+RSI_SELL = float(os.environ.get("RSI_SELL", "65"))
+MA_FAST  = int(os.environ.get("MA_FAST",    "20"))
+MA_SLOW  = int(os.environ.get("MA_SLOW",    "100"))
+MA_TREND = int(os.environ.get("MA_TREND",   "200"))
 
-TRADES_FILE           = Path(__file__).parent / "trades.json"
-
-# Signal config (ต้องตรงกับ dashboard/simulation)
-RSI_BUY_THRESHOLD     = float(os.environ.get("RSI_BUY",  "35"))
-RSI_SELL_THRESHOLD    = float(os.environ.get("RSI_SELL", "65"))
-MA_FAST               = int(os.environ.get("MA_FAST",    "20"))
-MA_SLOW               = int(os.environ.get("MA_SLOW",    "100"))
-MA_TREND              = int(os.environ.get("MA_TREND",   "200"))
-# ─────────────────────────────────────────────────────────────────────────────
+SIGNALS_FILE = Path(__file__).parent / "signals.json"
+MAX_HISTORY  = 500
+RETRY_SEC    = 60
 
 logging.basicConfig(
-    level   = logging.INFO,
-    format  = "%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt = "%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("monitor")
 
-
-# ════════════════════════════════════════════════════════════════════════════
-#  TRADE RECORD  (trades.json)
-# ════════════════════════════════════════════════════════════════════════════
-
+# ─── Default state ────────────────────────────────────────────────────────────
 DEFAULT_STATE = {
-    "state":         "CASH",   # "CASH" | "GOLD"
-    "cash":          INITIAL_CAPITAL,
-    "oz_held":       0.0,
-    "entry_price":   None,
-    "entry_date":    None,
-    "entry_cost":    0.0,
-    "trades":        [],       # list of completed + open trades
-    "last_checked":  None,
-    "last_signal":   None,
+    "last_signal":    None,
+    "last_checked":   None,
+    "last_price":     None,
+    "last_rsi":       None,
+    "last_ma_fast":   None,
+    "last_ma_slow":   None,
+    "last_ma_trend":  None,
+    "signal_reason":  None,
+    "algorithm_used": None,
+    "history":        [],
 }
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  STATE  (signals.json)
+# ════════════════════════════════════════════════════════════════════════════
+
 def load_state() -> dict:
-    """โหลด state จาก trades.json (หรือ default ถ้าไม่มีไฟล์)"""
-    if TRADES_FILE.exists():
+    if SIGNALS_FILE.exists():
         try:
-            with open(TRADES_FILE, "r", encoding="utf-8") as f:
+            with open(SIGNALS_FILE, encoding="utf-8") as f:
                 data = json.load(f)
-            # Merge กับ default เพื่อ handle missing keys จาก version เก่า
             merged = {**DEFAULT_STATE, **data}
-            merged["trades"] = data.get("trades", [])
-            log.info(f"Loaded state: {merged['state']} | "
-                     f"cash=${merged['cash']:.2f} | "
-                     f"oz={merged['oz_held']:.5f} | "
-                     f"{len(merged['trades'])} trade(s) recorded")
+            merged["history"] = data.get("history", [])
             return merged
         except Exception as e:
-            log.warning(f"Cannot load trades.json: {e} — using default state")
-    else:
-        log.info(f"No trades.json found — starting fresh with ${INITIAL_CAPITAL:.2f}")
-
-    state = DEFAULT_STATE.copy()
-    state["cash"]   = INITIAL_CAPITAL
-    state["trades"] = []
-    return state
+            log.warning(f"Cannot load signals.json: {e} — using default")
+    return DEFAULT_STATE.copy()
 
 
 def save_state(state: dict) -> None:
-    """บันทึก state ลง trades.json"""
     state["last_saved"] = datetime.now().isoformat(timespec="seconds")
-    with open(TRADES_FILE, "w", encoding="utf-8") as f:
+    with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False, default=str)
 
 
-def portfolio_value(state: dict, current_price: float) -> float:
-    """คำนวณ portfolio value ณ ราคาปัจจุบัน"""
-    if state["state"] == "CASH":
-        return state["cash"]
-    return state["oz_held"] * current_price
-
-
-def total_return_pct(state: dict, current_price: float) -> float:
-    val = portfolio_value(state, current_price)
-    return (val - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
-
-
 # ════════════════════════════════════════════════════════════════════════════
-#  SIGNAL DETECTION
+#  SIGNAL DETECTION  (พร้อม algorithm breakdown)
 # ════════════════════════════════════════════════════════════════════════════
 
-def get_current_signal() -> tuple[str, float, float, pd.Series]:
+def get_signal_data() -> dict:
     """
-    ดึงข้อมูล XAU/USD ล่าสุด คำนวณ indicators แล้วคืน signal
-    Returns: (signal, current_price, rsi, latest_row)
+    ดึงข้อมูล + คำนวณ indicators แล้วคืน dict ที่อธิบาย signal ครบถ้วน
+    รวมถึงว่า algorithm ไหน trigger
     """
     cfg = SimConfig(
-        rsi_buy_threshold  = RSI_BUY_THRESHOLD,
-        rsi_sell_threshold = RSI_SELL_THRESHOLD,
-        ma_fast  = MA_FAST,
-        ma_slow  = MA_SLOW,
-        ma_trend = MA_TREND,
+        rsi_buy_threshold  = RSI_BUY,
+        rsi_sell_threshold = RSI_SELL,
+        ma_fast=MA_FAST, ma_slow=MA_SLOW, ma_trend=MA_TREND,
     )
     df_raw = fetch_historical_data(cfg)
     df     = compute_indicators(df_raw, cfg)
+
     latest = df.iloc[-1]
-    signal = generate_signal(latest, cfg)
-    price  = float(latest["Close"])
-    rsi    = float(latest["RSI"]) if not pd.isna(latest.get("RSI", float("nan"))) else 0.0
-    return signal, price, rsi, latest
+    prev   = df.iloc[-2]
 
+    price     = float(latest["Close"])
+    rsi       = float(latest.get("RSI",           float("nan")))
+    ma_f      = float(latest.get(f"MA{MA_FAST}",  float("nan")))
+    ma_s      = float(latest.get(f"MA{MA_SLOW}",  float("nan")))
+    ma_t      = float(latest.get(f"MA{MA_TREND}", float("nan")))
+    prev_ma_f = float(prev.get(f"MA{MA_FAST}",    float("nan")))
+    prev_ma_s = float(prev.get(f"MA{MA_SLOW}",    float("nan")))
 
-def describe_signal(signal: str, price: float, rsi: float, row: pd.Series, cfg_ref: SimConfig) -> str:
-    """สร้างคำอธิบาย signal แบบละเอียด"""
-    parts = []
-    if rsi < cfg_ref.rsi_buy_threshold:
-        parts.append(f"RSI={rsi:.1f} (oversold <{cfg_ref.rsi_buy_threshold})")
-    elif rsi > cfg_ref.rsi_sell_threshold:
-        parts.append(f"RSI={rsi:.1f} (overbought >{cfg_ref.rsi_sell_threshold})")
+    # ── RSI sub-signal ────────────────────────────────────────────────────────
+    if not pd.isna(rsi):
+        if rsi < RSI_BUY:
+            rsi_signal = "BUY"
+            rsi_detail = f"RSI={rsi:.1f} → Oversold (ต่ำกว่า {RSI_BUY})"
+        elif rsi > RSI_SELL:
+            rsi_signal = "SELL"
+            rsi_detail = f"RSI={rsi:.1f} → Overbought (สูงกว่า {RSI_SELL})"
+        else:
+            rsi_signal = "HOLD"
+            rsi_detail = f"RSI={rsi:.1f} → Neutral (อยู่ใน {RSI_BUY}–{RSI_SELL})"
     else:
-        parts.append(f"RSI={rsi:.1f}")
+        rsi_signal, rsi_detail = "HOLD", "RSI=N/A (warm-up)"
 
-    ma_fast = row.get(f"MA{cfg_ref.ma_fast}", float("nan"))
-    ma_slow = row.get(f"MA{cfg_ref.ma_slow}", float("nan"))
-    if not pd.isna(ma_fast) and not pd.isna(ma_slow):
-        parts.append(f"MA{cfg_ref.ma_fast}={ma_fast:.0f} / MA{cfg_ref.ma_slow}={ma_slow:.0f}")
+    # ── MA Crossover sub-signal ───────────────────────────────────────────────
+    ma_signal = "HOLD"
+    ma_cross  = "ไม่มี crossover"
 
-    return " | ".join(parts)
+    if not any(pd.isna(v) for v in [ma_f, ma_s, ma_t, prev_ma_f, prev_ma_s]):
+        crossed_up   = prev_ma_f <= prev_ma_s and ma_f > ma_s
+        crossed_down = prev_ma_f >= prev_ma_s and ma_f < ma_s
+        above_trend  = price > ma_t
+
+        if crossed_up and above_trend:
+            ma_signal = "BUY"
+            ma_cross  = f"MA{MA_FAST} ข้ามขึ้นเหนือ MA{MA_SLOW} ✅ | ราคาเหนือ MA{MA_TREND} ✅"
+        elif crossed_up and not above_trend:
+            ma_cross  = f"MA{MA_FAST} ข้ามขึ้น แต่ราคาต่ำกว่า MA{MA_TREND} ⚠️ (ไม่นับ BUY)"
+        elif crossed_down:
+            ma_signal = "SELL"
+            ma_cross  = f"MA{MA_FAST} ข้ามลงใต้ MA{MA_SLOW} ❌"
+        else:
+            rel      = "เหนือ" if ma_f > ma_s else "ใต้"
+            ma_cross = f"MA{MA_FAST} อยู่{rel} MA{MA_SLOW} — ยังไม่ข้าม"
+
+    ma_detail = (
+        f"MA{MA_FAST}={ma_f:.0f} / MA{MA_SLOW}={ma_s:.0f} / MA{MA_TREND}={ma_t:.0f}"
+        f" | {ma_cross}"
+    )
+
+    # ── Final signal (RSI wins over MA on tie-break) ──────────────────────────
+    final_signal = generate_signal(latest, cfg)
+
+    if rsi_signal != "HOLD":
+        algorithm = "RSI"
+        reason    = rsi_detail
+    elif ma_signal != "HOLD":
+        algorithm = f"MA{MA_FAST}/{MA_SLOW} Crossover"
+        reason    = ma_detail
+    else:
+        algorithm = "—"
+        reason    = f"{rsi_detail} | {ma_cross}"
+
+    return {
+        "signal":      final_signal,
+        "price":       price,
+        "rsi":         rsi,
+        "ma_fast":     ma_f,
+        "ma_slow":     ma_s,
+        "ma_trend":    ma_t,
+        "rsi_signal":  rsi_signal,
+        "rsi_detail":  rsi_detail,
+        "ma_signal":   ma_signal,
+        "ma_detail":   ma_detail,
+        "ma_cross":    ma_cross,
+        "algorithm":   algorithm,
+        "reason":      reason,
+        "df":          df,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  TELEGRAM
+#  TELEGRAM MESSAGE
 # ════════════════════════════════════════════════════════════════════════════
+
+def build_message(data: dict, state: dict) -> str:
+    sig = data["signal"]
+    icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(sig, "⬜")
+    now  = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sep  = "─" * 28
+
+    rsi_used = data["algorithm"] == "RSI"
+    ma_used  = "MA" in data["algorithm"]
+
+    lines = [
+        f"{icon} <b>{sig} — XAU/USD</b>",
+        sep,
+        f"📅 {now}",
+        f"💰 Price : <b>${data['price']:,.2f}</b>",
+        sep,
+        "🧮 <b>Algorithm Breakdown</b>",
+        "",
+        f"  📊 RSI → {data['rsi_detail']}",
+        f"         {'✅ ใช้สัญญาณนี้' if rsi_used else ('⬜ RSI neutral' if data['rsi_signal']=='HOLD' else '⬜ ไม่ได้ใช้ (RSI wins)')}",
+        "",
+        f"  📈 MA  → {data['ma_cross']}",
+        f"         {'✅ ใช้สัญญาณนี้' if ma_used else ('⬜ ไม่มี crossover' if data['ma_signal']=='HOLD' else '⬜ ไม่ได้ใช้ (RSI wins)')}",
+        "",
+        sep,
+        f"🏆 <b>Decision: {sig}</b>",
+        f"   Triggered by: {data['algorithm'] or 'ไม่มีสัญญาณชัดเจน'}",
+    ]
+
+    # แสดงสัญญาณ BUY/SELL ล่าสุด
+    non_hold = [h for h in state.get("history", []) if h.get("signal") in ("BUY", "SELL")]
+    if non_hold:
+        last = non_hold[-1]
+        lines += [
+            sep,
+            f"📌 สัญญาณ BUY/SELL ล่าสุด: {last['signal']} @ ${last['price']:,.2f}"
+            f"  ({str(last['date'])[:10]})",
+        ]
+
+    return "\n".join(lines)
+
 
 def send_telegram(message: str) -> bool:
     if DRY_RUN:
-        log.info("[DRY RUN] Telegram message:\n" + message)
+        log.info(f"[DRY RUN] Telegram:\n{message}")
         return True
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured — skipping")
         return False
-    url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, data=data, timeout=10)
+        r = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
         if r.status_code == 200:
             log.info("Telegram sent ✓")
             return True
-        log.warning(f"Telegram error {r.status_code}: {r.text[:200]}")
-        return False
+        log.warning(f"Telegram {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        log.warning(f"Telegram exception: {e}")
-        return False
-
-
-def build_buy_message(price: float, oz: float, cost: float,
-                      state: dict, reason: str) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    pnl_trades = [t for t in state["trades"] if t.get("pnl_usd") is not None]
-    wins  = sum(1 for t in pnl_trades if t["pnl_usd"] > 0)
-    total = len(pnl_trades)
-    return (
-        f"🟢 <b>BUY SIGNAL — XAU/USD</b>\n"
-        f"{'─'*30}\n"
-        f"📅 {now}\n"
-        f"💰 Price   : <b>${price:,.2f}</b>\n"
-        f"⚖️  Oz held  : {oz:.5f} oz\n"
-        f"💵 Capital  : ${cost:.2f} (all-in)\n"
-        f"{'─'*30}\n"
-        f"📊 Signal   : {reason}\n"
-        f"{'─'*30}\n"
-        f"📈 Track record: {wins}W/{total-wins}L ({total} closed)\n"
-        f"🏦 Portfolio: ${portfolio_value(state, price):.2f} "
-        f"({total_return_pct(state, price):+.2f}% total)"
-    )
-
-
-def build_sell_message(price: float, pnl_usd: float, pnl_pct: float,
-                       duration_days: int, state: dict, reason: str) -> str:
-    now   = datetime.now().strftime("%Y-%m-%d %H:%M")
-    icon  = "✅" if pnl_usd >= 0 else "🔴"
-    sign  = "+" if pnl_usd >= 0 else ""
-    pnl_trades = [t for t in state["trades"] if t.get("pnl_usd") is not None]
-    wins  = sum(1 for t in pnl_trades if t["pnl_usd"] > 0)
-    total = len(pnl_trades)
-    return (
-        f"{icon} <b>SELL SIGNAL — XAU/USD</b>\n"
-        f"{'─'*30}\n"
-        f"📅 {now}\n"
-        f"💰 Price    : <b>${price:,.2f}</b>\n"
-        f"📊 P&L      : <b>{sign}${pnl_usd:.2f} ({sign}{pnl_pct:.2f}%)</b>\n"
-        f"⏱️  Duration  : {duration_days} days\n"
-        f"{'─'*30}\n"
-        f"📊 Signal   : {reason}\n"
-        f"{'─'*30}\n"
-        f"📈 Track record: {wins}W/{total-wins}L ({total} closed)\n"
-        f"🏦 Cash     : ${state['cash']:.2f} "
-        f"({total_return_pct(state, price):+.2f}% total)"
-    )
-
-
-def build_hold_message(price: float, rsi: float, state: dict) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    pos = state["state"]
-    if pos == "GOLD":
-        pnl = (price - state["entry_price"]) / state["entry_price"] * 100
-        pos_str = f"GOLD | Entry ${state['entry_price']:,.2f} | Unrealized {pnl:+.1f}%"
-    else:
-        pos_str = f"CASH | ${state['cash']:.2f}"
-    return (
-        f"⚪ <b>HOLD — XAU/USD</b>\n"
-        f"📅 {now}\n"
-        f"💰 Price : ${price:,.2f} | RSI: {rsi:.1f}\n"
-        f"📌 Position: {pos_str}"
-    )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  TRADE EXECUTION (virtual)
-# ════════════════════════════════════════════════════════════════════════════
-
-def execute_buy(state: dict, price: float, reason: str, row: pd.Series) -> dict:
-    """จำลองการ BUY all-in"""
-    cost       = state["cash"] * (1 - TRANSACTION_COST)
-    oz         = cost / price
-    now_str    = datetime.now().isoformat(timespec="seconds")
-
-    state["state"]       = "GOLD"
-    state["oz_held"]     = oz
-    state["entry_price"] = price
-    state["entry_cost"]  = cost
-    state["entry_date"]  = now_str
-    state["cash"]        = 0.0
-
-    trade = {
-        "id":         len(state["trades"]) + 1,
-        "action":     "BUY",
-        "date":       now_str,
-        "price":      price,
-        "oz":         oz,
-        "cost":       cost,
-        "reason":     reason,
-        "pnl_usd":    None,
-        "pnl_pct":    None,
-        "duration":   None,
-        "balance":    cost,
-    }
-    state["trades"].append(trade)
-    log.info(f"BUY  @ ${price:,.2f} | {oz:.5f} oz | cost=${cost:.2f} | {reason}")
-    return state
-
-
-def execute_sell(state: dict, price: float, reason: str) -> tuple[dict, float, float, int]:
-    """จำลองการ SELL all-out"""
-    gross     = state["oz_held"] * price
-    net       = gross * (1 - TRANSACTION_COST)
-    pnl_usd   = net - state["entry_cost"]
-    pnl_pct   = pnl_usd / state["entry_cost"] * 100
-    entry_dt  = datetime.fromisoformat(state["entry_date"]) if state["entry_date"] else datetime.now()
-    duration  = (datetime.now() - entry_dt).days
-    now_str   = datetime.now().isoformat(timespec="seconds")
-
-    # อัปเดต BUY trade ที่ match กัน
-    for t in reversed(state["trades"]):
-        if t["action"] == "BUY" and t.get("pnl_usd") is None:
-            t["pnl_usd"]  = pnl_usd
-            t["pnl_pct"]  = pnl_pct
-            t["duration"] = duration
-            t["closed_date"] = now_str
-            t["close_price"] = price
-            break
-
-    sell_trade = {
-        "id":       len(state["trades"]) + 1,
-        "action":   "SELL",
-        "date":     now_str,
-        "price":    price,
-        "oz":       state["oz_held"],
-        "pnl_usd":  pnl_usd,
-        "pnl_pct":  pnl_pct,
-        "duration": duration,
-        "reason":   reason,
-        "balance":  net,
-    }
-    state["trades"].append(sell_trade)
-
-    state["state"]       = "CASH"
-    state["cash"]        = net
-    state["oz_held"]     = 0.0
-    state["entry_price"] = None
-    state["entry_date"]  = None
-    state["entry_cost"]  = 0.0
-
-    log.info(f"SELL @ ${price:,.2f} | P&L=${pnl_usd:+.2f} ({pnl_pct:+.2f}%) | "
-             f"cash=${net:.2f} | {duration}d")
-    return state, pnl_usd, pnl_pct, duration
+        log.warning(f"Telegram error: {e}")
+    return False
 
 
 # ════════════════════════════════════════════════════════════════════════════
 #  MAIN CHECK CYCLE
 # ════════════════════════════════════════════════════════════════════════════
 
-def run_check(state: dict, send_hold_alert: bool = False) -> dict:
-    """
-    ตรวจสัญญาณ 1 รอบ อัปเดต state และส่ง Telegram ถ้าจำเป็น
-    Returns: updated state
-    """
+def run_check(state: dict) -> dict:
+    """ตรวจสัญญาณ 1 รอบ → อัปเดต state → ส่ง Telegram"""
     log.info("─── Checking signal ───")
 
-    cfg_ref = SimConfig(
-        rsi_buy_threshold  = RSI_BUY_THRESHOLD,
-        rsi_sell_threshold = RSI_SELL_THRESHOLD,
-        ma_fast = MA_FAST, ma_slow = MA_SLOW, ma_trend = MA_TREND,
-    )
+    data    = get_signal_data()
+    sig     = data["signal"]
+    now_str = datetime.now().isoformat(timespec="seconds")
 
-    try:
-        signal, price, rsi, row = get_current_signal()
-    except Exception as e:
-        log.error(f"Failed to get signal: {e}")
-        state["last_checked"] = datetime.now().isoformat(timespec="seconds")
-        state["last_signal"]  = "ERROR"
-        save_state(state)
-        return state
+    log.info(f"Signal={sig} | Price=${data['price']:,.2f} | "
+             f"RSI={data['rsi']:.1f} | Algorithm={data['algorithm']}")
 
-    reason = describe_signal(signal, price, rsi, row, cfg_ref)
-    log.info(f"Signal={signal} | Price=${price:,.2f} | {reason}")
+    state.update({
+        "last_signal":    sig,
+        "last_checked":   now_str,
+        "last_price":     data["price"],
+        "last_rsi":       data["rsi"],
+        "last_ma_fast":   data["ma_fast"],
+        "last_ma_slow":   data["ma_slow"],
+        "last_ma_trend":  data["ma_trend"],
+        "signal_reason":  data["reason"],
+        "algorithm_used": data["algorithm"],
+    })
 
-    state["last_checked"] = datetime.now().isoformat(timespec="seconds")
-    state["last_signal"]  = signal
-    state["last_price"]   = price
-    state["last_rsi"]     = rsi
+    entry = {
+        "date":      now_str,
+        "signal":    sig,
+        "price":     data["price"],
+        "rsi":       round(data["rsi"], 2),
+        "ma_fast":   round(data["ma_fast"], 2),
+        "ma_slow":   round(data["ma_slow"], 2),
+        "ma_trend":  round(data["ma_trend"], 2),
+        "reason":    data["reason"],
+        "algorithm": data["algorithm"],
+    }
+    state["history"] = (state.get("history", []) + [entry])[-MAX_HISTORY:]
 
-    # ── BUY ───────────────────────────────────────────────────────────────────
-    if signal == "BUY" and state["state"] == "CASH":
-        state = execute_buy(state, price, reason, row)
-        oz    = state["oz_held"]
-        cost  = state["entry_cost"]
-        msg   = build_buy_message(price, oz, cost, state, reason)
-        send_telegram(msg)
-
-    # ── SELL ──────────────────────────────────────────────────────────────────
-    elif signal == "SELL" and state["state"] == "GOLD":
-        state, pnl_usd, pnl_pct, duration = execute_sell(state, price, reason)
-        msg = build_sell_message(price, pnl_usd, pnl_pct, duration, state, reason)
-        send_telegram(msg)
-
-    # ── HOLD ──────────────────────────────────────────────────────────────────
-    else:
-        pv = portfolio_value(state, price)
-        rt = total_return_pct(state, price)
-        log.info(f"HOLD | portfolio=${pv:.2f} ({rt:+.2f}%) | position={state['state']}")
-        if send_hold_alert:
-            send_telegram(build_hold_message(price, rsi, state))
+    # ส่ง Telegram: BUY/SELL เสมอ, HOLD เฉพาะถ้า SEND_HOLD=true
+    if sig in ("BUY", "SELL") or (sig == "HOLD" and SEND_HOLD):
+        send_telegram(build_message(data, state))
 
     save_state(state)
     return state
-
-
-def print_status(state: dict) -> None:
-    """แสดง position ปัจจุบันใน terminal"""
-    W = 50
-    print("=" * W)
-    print("  GOLD MONITOR — CURRENT STATUS")
-    print("=" * W)
-
-    last_price = state.get("last_price") or 0.0
-    pv  = portfolio_value(state, last_price)
-    ret = total_return_pct(state, last_price)
-    closed = [t for t in state["trades"] if t["action"] == "SELL"]
-    wins   = sum(1 for t in closed if (t.get("pnl_usd") or 0) > 0)
-
-    print(f"  Position   : {state['state']}")
-    if state["state"] == "GOLD":
-        print(f"  Entry      : ${state['entry_price']:,.2f} @ {state['entry_date'][:10]}")
-        if last_price:
-            unreal = (last_price - state["entry_price"]) / state["entry_price"] * 100
-            print(f"  Unrealized : {unreal:+.2f}%")
-    print(f"  Cash       : ${state['cash']:.2f}")
-    print(f"  Portfolio  : ${pv:.2f}  ({ret:+.2f}%)")
-    print(f"  Last check : {state.get('last_checked', '—')}")
-    print(f"  Last signal: {state.get('last_signal', '—')}")
-    print(f"  Last price : ${last_price:,.2f}")
-    print("─" * W)
-    print(f"  Closed trades : {len(closed)}")
-    print(f"  Win rate      : {wins}/{len(closed)} ({wins/len(closed)*100:.0f}%)" if closed else "  Win rate      : —")
-    print("=" * W)
-
-    if state["trades"]:
-        print(f"\n  {'#':<4} {'Date':<12} {'Act':<5} {'Price':>10} {'P&L ($)':>10} {'P&L (%)':>8}")
-        print("  " + "─" * 52)
-        for t in state["trades"][-10:]:   # แสดง 10 อันล่าสุด
-            dt_s  = str(t.get("date", ""))[:10]
-            act   = t["action"]
-            price_s = f"${t['price']:,.2f}"
-            pnl_u = f"{t['pnl_usd']:+.2f}" if t.get("pnl_usd") is not None else "—"
-            pnl_p = f"{t['pnl_pct']:+.2f}%" if t.get("pnl_pct") is not None else "—"
-            print(f"  {t.get('id',0):<4} {dt_s:<12} {act:<5} {price_s:>10} {pnl_u:>10} {pnl_p:>8}")
-        print()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -437,53 +306,65 @@ def print_status(state: dict) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def run_continuous() -> None:
-    """รันต่อเนื่อง loop ไม่หยุด"""
-    log.info(f"Starting continuous monitor — interval={CHECK_INTERVAL_MIN}m | "
-             f"RSI {RSI_BUY_THRESHOLD}/{RSI_SELL_THRESHOLD} | "
-             f"MA {MA_FAST}/{MA_SLOW}/{MA_TREND} | "
-             f"capital=${INITIAL_CAPITAL}")
+    log.info(f"Starting monitor | interval={CHECK_INTERVAL_MIN}m | "
+             f"RSI {RSI_BUY}/{RSI_SELL} | MA {MA_FAST}/{MA_SLOW}/{MA_TREND} | "
+             f"SEND_HOLD={SEND_HOLD}")
     state = load_state()
-
     while True:
         try:
             state = run_check(state)
         except KeyboardInterrupt:
-            log.info("Stopped by user.")
+            log.info("Stopped.")
             break
         except Exception as e:
-            log.error(f"Unexpected error: {e}", exc_info=True)
+            log.error(f"Error: {e}", exc_info=True)
+            log.info(f"Retry in {RETRY_SEC}s …")
+            try:
+                time.sleep(RETRY_SEC)
+            except KeyboardInterrupt:
+                break
+            continue
 
-        next_check = datetime.now() + timedelta(minutes=CHECK_INTERVAL_MIN)
-        log.info(f"Next check at {next_check.strftime('%H:%M:%S')} "
-                 f"(sleeping {CHECK_INTERVAL_MIN}m)")
+        next_t = datetime.now() + timedelta(minutes=CHECK_INTERVAL_MIN)
+        log.info(f"Next check: {next_t.strftime('%H:%M:%S')} (sleep {CHECK_INTERVAL_MIN}m)")
         try:
             time.sleep(CHECK_INTERVAL_MIN * 60)
         except KeyboardInterrupt:
-            log.info("Stopped by user.")
+            log.info("Stopped.")
             break
 
 
 def run_once() -> None:
-    """รันครั้งเดียว (สำหรับ GitHub Actions / cron)"""
-    log.info("Running single check (--once mode)")
+    log.info("Running single check (--once)")
     state = load_state()
-    state = run_check(state, send_hold_alert=True)
-    print_status(state)
+    state = run_check(state)
+    _print_status(state)
+
+
+def _print_status(state: dict) -> None:
+    print("=" * 50)
+    print("  GOLD SIGNAL MONITOR — STATUS")
+    print("=" * 50)
+    print(f"  Signal    : {state.get('last_signal', '—')}")
+    print(f"  Price     : ${state.get('last_price') or 0:,.2f}")
+    print(f"  RSI       : {state.get('last_rsi') or '—'}")
+    print(f"  Algorithm : {state.get('algorithm_used', '—')}")
+    print(f"  Reason    : {state.get('signal_reason', '—')}")
+    print(f"  Checked   : {state.get('last_checked', '—')}")
+    print(f"  History   : {len(state.get('history', []))} entries")
+    print("=" * 50)
+    hist = state.get("history", [])
+    if hist:
+        print(f"\n  {'Date':<22} {'Signal':<6} {'Price':>10} {'RSI':>6}  Algorithm")
+        print("  " + "─" * 58)
+        for h in hist[-10:]:
+            print(f"  {str(h['date'])[:19]:<22} {h['signal']:<6} "
+                  f"${h['price']:>9,.2f} {h['rsi']:>6.1f}  {h['algorithm']}")
 
 
 def show_status() -> None:
-    """แสดง status แล้วออก"""
     state = load_state()
-    # ดึงราคาล่าสุดสำหรับ unrealized P&L
-    try:
-        import yfinance as yf
-        raw = yf.download("GC=F", period="2d", auto_adjust=True, progress=False)
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        state["last_price"] = float(raw["Close"].dropna().iloc[-1])
-    except Exception:
-        pass
-    print_status(state)
+    _print_status(state)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -491,12 +372,10 @@ def show_status() -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Gold Live Signal Monitor")
-    group  = parser.add_mutually_exclusive_group()
-    group.add_argument("--once",   action="store_true",
-                       help="Run one check and exit (for cron/GitHub Actions)")
-    group.add_argument("--status", action="store_true",
-                       help="Show current position and exit")
+    parser = argparse.ArgumentParser(description="Gold Signal Monitor")
+    grp    = parser.add_mutually_exclusive_group()
+    grp.add_argument("--once",   action="store_true", help="Run one check and exit")
+    grp.add_argument("--status", action="store_true", help="Show last status and exit")
     args = parser.parse_args()
 
     if args.status:

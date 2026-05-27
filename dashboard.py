@@ -1,27 +1,23 @@
 """
-Gold Trading Dashboard — Streamlit
-====================================
-Monitor & visualize gold trading simulation results
-Deploy ฟรีบน Streamlit Cloud (streamlit.io)
+Gold Signal Dashboard — Streamlit
+===================================
+แสดงสัญญาณ BUY/SELL/HOLD + กราฟ indicators + อธิบาย algorithm
+ไม่มีการ simulate การลงทุน
 
-Run locally:
-    streamlit run dashboard.py
-
-Deploy:
-    1. Push to GitHub
-    2. Go to share.streamlit.io → New app → select this file
+Deploy บน Streamlit Cloud:
+  1. Push to GitHub
+  2. share.streamlit.io → New app → dashboard.py
+  3. ใส่ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID ใน Secrets
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from pathlib import Path
 import json
-import requests
 import threading
 import time as _time_mod
 
@@ -29,59 +25,49 @@ from gold_simulation import (
     SimConfig,
     fetch_historical_data,
     compute_indicators,
-    run_simulation,
-    calculate_metrics,
-    run_parameter_sweep,
-    run_walk_forward,
-    run_monte_carlo,
 )
-from live_monitor import run_check, load_state, save_state, portfolio_value, total_return_pct
+from live_monitor import (
+    run_check,
+    load_state,
+    save_state,
+    get_signal_data,
+    RSI_BUY, RSI_SELL, MA_FAST, MA_SLOW, MA_TREND,
+)
 
-TRADES_FILE = Path(__file__).parent / "trades.json"
+SIGNALS_FILE = Path(__file__).parent / "signals.json"
 
 # ─── Background Monitor Thread ────────────────────────────────────────────────
-# Module-level variables — persist across Streamlit reruns (same process)
-_monitor_lock   = threading.Lock()
+_monitor_lock  = threading.Lock()
 _monitor_thread: threading.Thread | None = None
-_monitor_stop   = threading.Event()
+_monitor_stop  = threading.Event()
 _monitor_meta: dict = {
-    "running":      False,
-    "last_check":   None,
-    "next_check":   None,
-    "error":        None,
-    "interval":     60,
-    "should_run":   True,   # ← intent flag: True = user wants it running
+    "running":       False,
+    "last_check":    None,
+    "next_check":    None,
+    "error":         None,
+    "interval":      60,
+    "should_run":    True,
     "restart_count": 0,
 }
-_RETRY_DELAY_SEC = 60   # รอ 60 วิ แล้ว retry ถ้า check พัง
+_RETRY_SEC = 60
 
 
 def _monitor_loop(interval_min: int) -> None:
-    """
-    Background thread: ตรวจสัญญาณทุก interval_min นาที
-    - Exception ใน run_check → log error + retry อีก _RETRY_DELAY_SEC วิ (ไม่หยุด)
-    - ออกเมื่อ _monitor_stop set เท่านั้น
-    """
     _monitor_meta["running"] = True
     state = load_state()
-
     while not _monitor_stop.is_set():
         try:
             state = run_check(state)
             _monitor_meta["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _monitor_meta["error"]      = None
-            # รอตามปกติ
             next_dt = datetime.now() + timedelta(minutes=interval_min)
             _monitor_meta["next_check"] = next_dt.strftime("%Y-%m-%d %H:%M:%S")
             _monitor_stop.wait(timeout=interval_min * 60)
-
         except Exception as exc:
             _monitor_meta["error"] = f"{type(exc).__name__}: {exc}"
-            # retry เร็วขึ้น แทนที่จะรอเต็ม interval
-            next_dt = datetime.now() + timedelta(seconds=_RETRY_DELAY_SEC)
+            next_dt = datetime.now() + timedelta(seconds=_RETRY_SEC)
             _monitor_meta["next_check"] = next_dt.strftime("%Y-%m-%d %H:%M:%S") + " (retry)"
-            _monitor_stop.wait(timeout=_RETRY_DELAY_SEC)
-
+            _monitor_stop.wait(timeout=_RETRY_SEC)
     _monitor_meta["running"] = False
 
 
@@ -89,10 +75,10 @@ def start_monitor(interval_min: int = 60) -> None:
     global _monitor_thread
     with _monitor_lock:
         if _monitor_thread and _monitor_thread.is_alive():
-            return  # already running
+            return
         _monitor_stop.clear()
-        _monitor_meta["interval"]    = interval_min
-        _monitor_meta["should_run"]  = True
+        _monitor_meta["interval"]      = interval_min
+        _monitor_meta["should_run"]    = True
         _monitor_meta["restart_count"] += 1
         _monitor_thread = threading.Thread(
             target=_monitor_loop, args=(interval_min,),
@@ -112,10 +98,7 @@ def is_monitor_running() -> bool:
 
 
 def _watchdog() -> bool:
-    """
-    เรียกทุก Streamlit rerun — ถ้า thread ตายแต่ user ยังต้องการให้รัน → restart อัตโนมัติ
-    Returns True ถ้าเพิ่ง restart
-    """
+    """เรียกทุก rerun — restart thread อัตโนมัติถ้าตายแต่ควรรัน"""
     if _monitor_meta["should_run"] and not is_monitor_running():
         start_monitor(interval_min=_monitor_meta["interval"])
         return True
@@ -123,22 +106,21 @@ def _watchdog() -> bool:
 
 
 def check_now_once() -> None:
-    """รันตรวจสัญญาณ 1 ครั้งทันที (blocking ~10 วินาที)"""
     state = load_state()
     run_check(state)
 
 
-# ─── Auto-start on app load ───────────────────────────────────────────────────
-# เริ่ม thread ทันทีที่ app โหลด (ครั้งแรก) โดยไม่ต้องรอกด Start
+# Auto-start เมื่อ app โหลด
 if not is_monitor_running() and _monitor_meta["should_run"]:
     start_monitor(interval_min=_monitor_meta["interval"])
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  PAGE CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Gold Trading Simulator",
+    page_title="Gold Signal Monitor",
     page_icon="🥇",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -153,124 +135,21 @@ st.markdown("""
         border: 1px solid #313244;
     }
     div[data-testid="stSidebar"] { background: #181825; }
-    .live-price-box {
-        background: linear-gradient(135deg, #1e1e2e 0%, #313244 100%);
-        border: 1px solid #f9e2af44;
-        border-radius: 12px;
-        padding: 16px 24px;
-        margin-bottom: 16px;
+    .signal-card {
+        border-radius: 14px;
+        padding: 22px 28px;
+        margin-bottom: 18px;
+        font-size: 1.05em;
+    }
+    .algo-card {
+        background: #1e1e2e;
+        border-radius: 10px;
+        padding: 16px 20px;
+        border: 1px solid #313244;
+        height: 100%;
     }
 </style>
 """, unsafe_allow_html=True)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_live_price() -> dict:
-    """
-    ดึงราคา XAU/USD ล่าสุด — cache 60 วินาที
-    Fallback: yfinance GC=F → yfinance GLD×10 → yfinance IAU×50
-    (Stooq ถูกลบออกเพราะต้องการ API key แล้ว)
-    """
-    import yfinance as yf
-
-    for sym, mult in [("GC=F", 1.0), ("GLD", 10.0), ("IAU", 50.0)]:
-        try:
-            raw = yf.download(sym, period="5d", interval="1d",
-                              auto_adjust=True, progress=False)
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = raw.columns.get_level_values(0)
-            closes = raw["Close"].dropna() * mult
-            if len(closes) < 1:
-                continue
-            price = float(closes.iloc[-1])
-            prev  = float(closes.iloc[-2]) if len(closes) >= 2 else price
-            chg   = price - prev
-            chg_p = chg / prev * 100
-            ts    = closes.index[-1].strftime("%Y-%m-%d")
-            return {
-                "price": price, "change": chg, "change_pct": chg_p,
-                "date": ts, "source": sym, "ok": True,
-            }
-        except Exception:
-            continue
-
-    return {"price": 0, "change": 0, "change_pct": 0, "date": "—", "source": "—", "ok": False}
-
-
-@st.cache_data(ttl=3600, show_spinner="Fetching XAU/USD history...")
-def cached_fetch(data_days: int) -> pd.DataFrame:
-    cfg = SimConfig(data_days=data_days)
-    return fetch_historical_data(cfg)
-
-
-@st.cache_data(ttl=300, show_spinner="Running simulation...")
-def cached_run(initial_capital, transaction_cost, rsi_buy, rsi_sell,
-               ma_fast, ma_slow, ma_trend):
-    cfg = SimConfig(
-        initial_capital    = initial_capital,
-        transaction_cost   = transaction_cost,
-        rsi_buy_threshold  = float(rsi_buy),
-        rsi_sell_threshold = float(rsi_sell),
-        ma_fast = ma_fast, ma_slow = ma_slow, ma_trend = ma_trend,
-    )
-    df_raw = cached_fetch(cfg.data_days)
-    df     = compute_indicators(df_raw.copy(), cfg)
-    tlog, ecurve = run_simulation(df, cfg)
-    metrics      = calculate_metrics(tlog, ecurve, df, cfg)
-    return cfg, df_raw, df, tlog, ecurve, metrics
-
-
-@st.cache_data(ttl=300, show_spinner="Parameter sweep...")
-def cached_sweep(initial_capital, transaction_cost, rsi_buy, rsi_sell,
-                 ma_fast, ma_slow, ma_trend):
-    cfg = SimConfig(
-        initial_capital=initial_capital, transaction_cost=transaction_cost,
-        rsi_buy_threshold=float(rsi_buy), rsi_sell_threshold=float(rsi_sell),
-        ma_fast=ma_fast, ma_slow=ma_slow, ma_trend=ma_trend,
-    )
-    df_raw = cached_fetch(cfg.data_days)
-    return run_parameter_sweep(df_raw, cfg)
-
-
-@st.cache_data(ttl=300, show_spinner="Walk-forward test...")
-def cached_wf(initial_capital, transaction_cost, rsi_buy, rsi_sell,
-              ma_fast, ma_slow, ma_trend):
-    cfg = SimConfig(
-        initial_capital=initial_capital, transaction_cost=transaction_cost,
-        rsi_buy_threshold=float(rsi_buy), rsi_sell_threshold=float(rsi_sell),
-        ma_fast=ma_fast, ma_slow=ma_slow, ma_trend=ma_trend,
-    )
-    df_raw = cached_fetch(cfg.data_days)
-    return run_walk_forward(df_raw, cfg)
-
-
-@st.cache_data(ttl=300, show_spinner="Monte Carlo (1000 runs)...")
-def cached_mc(initial_capital, transaction_cost, rsi_buy, rsi_sell,
-              ma_fast, ma_slow, ma_trend):
-    cfg = SimConfig(
-        initial_capital=initial_capital, transaction_cost=transaction_cost,
-        rsi_buy_threshold=float(rsi_buy), rsi_sell_threshold=float(rsi_sell),
-        ma_fast=ma_fast, ma_slow=ma_slow, ma_trend=ma_trend,
-    )
-    df_raw = cached_fetch(cfg.data_days)
-    df     = compute_indicators(df_raw.copy(), cfg)
-    tlog, _ = run_simulation(df, cfg)
-    return run_monte_carlo(tlog, cfg)
-
-
-def _ecurve_value_at(ecurve: list[dict], target_date) -> float | None:
-    """หาค่า equity curve ที่ตรงกับ target_date (หรือใกล้ที่สุด)"""
-    target = pd.Timestamp(target_date)
-    best_val, best_diff = None, float("inf")
-    for e in ecurve:
-        diff = abs((pd.Timestamp(e["date"]) - target).total_seconds())
-        if diff < best_diff:
-            best_diff, best_val = diff, e["value"]
-    return best_val
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -278,104 +157,103 @@ def _ecurve_value_at(ecurve: list[dict], target_date) -> float | None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown("## 🥇 Gold Simulator")
-    st.caption("All-in backtest • XAU/USD")
+    st.markdown("## 🥇 Gold Signal Monitor")
+    st.caption("XAU/USD — Signal only, no simulation")
     st.divider()
 
-    st.subheader("💰 Capital")
-    initial_capital = st.number_input(
-        "Initial Capital ($)", min_value=10.0, max_value=1_000_000.0,
-        value=100.0, step=10.0, format="%.2f",
-    )
-    transaction_cost = st.slider(
-        "Transaction Cost (%)", 0.0, 1.0, 0.1, 0.05
-    ) / 100
-
-    st.divider()
     st.subheader("📊 Signal Parameters")
     c1, c2 = st.columns(2)
-    rsi_buy  = c1.number_input("RSI Buy <",  10, 49, 35)
-    rsi_sell = c2.number_input("RSI Sell >", 51, 90, 65)
-    c3, c4 = st.columns(2)
-    ma_fast  = c3.selectbox("MA Fast",  [5, 10, 20, 50],       index=2)
-    ma_slow  = c4.selectbox("MA Slow",  [50, 100, 150, 200],    index=1)
-    ma_trend = st.selectbox("MA Trend", [100, 150, 200, 250],   index=2)
+    rsi_buy  = c1.number_input("RSI Buy <",  10, 49, int(RSI_BUY))
+    rsi_sell = c2.number_input("RSI Sell >", 51, 90, int(RSI_SELL))
+    c3, c4   = st.columns(2)
+    ma_fast  = c3.selectbox("MA Fast",  [5, 10, 20, 50],      index=[5,10,20,50].index(MA_FAST)  if MA_FAST  in [5,10,20,50]  else 2)
+    ma_slow  = c4.selectbox("MA Slow",  [50, 100, 150, 200],  index=[50,100,150,200].index(MA_SLOW) if MA_SLOW in [50,100,150,200] else 1)
+    ma_trend = st.selectbox("MA Trend", [100, 150, 200, 250], index=[100,150,200,250].index(MA_TREND) if MA_TREND in [100,150,200,250] else 2)
 
     st.divider()
-    st.subheader("🔬 Validation")
-    run_sweep = st.checkbox("Parameter Sweep",        value=True)
-    run_wf    = st.checkbox("Walk-forward Test",       value=True)
-    run_mc    = st.checkbox("Monte Carlo (1000 runs)", value=True)
+    send_hold_ui = st.toggle("ส่ง HOLD ทาง Telegram ด้วย", value=False)
 
     st.divider()
-    run_btn      = st.button("▶  Run Simulation", type="primary", use_container_width=True)
-    refresh_live = st.button("🔄 Refresh Live Price", use_container_width=True)
+    data_days = st.slider("ข้อมูลย้อนหลัง (วัน)", 100, 1000, 500, 50)
 
-    if refresh_live:
-        st.cache_data.clear()
-        st.rerun()
+    st.divider()
+    check_interval = st.selectbox("ตรวจทุก (นาที)", [15, 30, 60, 120, 240], index=2)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  HEADER — LIVE PRICE
+#  CACHED DATA
 # ═════════════════════════════════════════════════════════════════════════════
 
-st.title("🥇 Gold Trading Simulator")
-
-# ── Main navigation tabs ──────────────────────────────────────────────────────
-tab_live, tab_sim = st.tabs(["📡 Live Monitor", "🔬 Backtest Simulation"])
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  TAB 1 — LIVE MONITOR
-# ═════════════════════════════════════════════════════════════════════════════
-
-with tab_live:
-    # ── Watchdog: restart thread อัตโนมัติถ้าตายแต่ควรรัน ─────────────────────
-    _just_restarted = _watchdog()
-
-    # ── Auto-refresh countdown ────────────────────────────────────────────────
-    lm_col1, lm_col2, lm_col3 = st.columns([3, 1, 1])
-    with lm_col1:
-        st.subheader("📡 Live Signal Monitor")
-        st.caption("ตรวจสัญญาณ XAU/USD แบบ real-time | thread รันใน background อัตโนมัติ")
-    with lm_col2:
-        auto_refresh = st.toggle("Auto-refresh", value=False)
-    with lm_col3:
-        refresh_interval = st.selectbox("ทุก (วิ)", [30, 60, 120, 300], index=1,
-                                        label_visibility="collapsed")
-
-    if auto_refresh:
-        st.info(f"🔄 Auto-refresh ทุก {refresh_interval} วินาที")
-        _time_mod.sleep(refresh_interval)
-        st.rerun()
-
-    if _just_restarted:
-        st.toast("♻️ Monitor thread restarted อัตโนมัติ", icon="♻️")
-
-    # ── Monitor Control Panel ─────────────────────────────────────────────────
-    running = is_monitor_running()
-    st.markdown("#### 🎛️ Monitor Control")
-    cc1, cc2, cc3, cc4, cc5 = st.columns([1, 1, 1, 1, 2])
-
-    check_interval_min = cc5.selectbox(
-        "Check interval (min)", [15, 30, 60, 120, 240], index=2,
-        key="monitor_interval",
+@st.cache_data(ttl=3600, show_spinner="Fetching XAU/USD data…")
+def cached_fetch(days: int, rsi_b: float, rsi_s: float,
+                 maf: int, mas: int, mat: int) -> pd.DataFrame:
+    cfg = SimConfig(
+        data_days=days,
+        rsi_buy_threshold=rsi_b, rsi_sell_threshold=rsi_s,
+        ma_fast=maf, ma_slow=mas, ma_trend=mat,
     )
+    df_raw = fetch_historical_data(cfg)
+    return compute_indicators(df_raw, cfg)
 
-    if cc1.button("▶ Start", type="primary", disabled=running, use_container_width=True):
-        start_monitor(interval_min=check_interval_min)
-        st.success(f"Monitor started — ตรวจทุก {check_interval_min} นาที")
+
+@st.cache_data(ttl=10, show_spinner=False)
+def load_signals_json() -> dict | None:
+    if SIGNALS_FILE.exists():
+        try:
+            with open(SIGNALS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  HEADER
+# ═════════════════════════════════════════════════════════════════════════════
+
+st.title("🥇 Gold Signal Monitor")
+
+tab_signal, tab_history = st.tabs(["📡 Signal & Chart", "📋 Signal History"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 1 — SIGNAL & CHART
+# ═════════════════════════════════════════════════════════════════════════════
+
+with tab_signal:
+
+    # ── Watchdog ─────────────────────────────────────────────────────────────
+    _just_restarted = _watchdog()
+    if _just_restarted:
+        st.toast("♻️ Monitor restarted อัตโนมัติ", icon="♻️")
+
+    # ── Auto-refresh ──────────────────────────────────────────────────────────
+    ar_col1, ar_col2, ar_col3 = st.columns([4, 1, 1])
+    with ar_col2:
+        auto_refresh = st.toggle("Auto-refresh", value=False)
+    with ar_col3:
+        ar_interval = st.selectbox("วิ", [30, 60, 120, 300], index=1,
+                                   label_visibility="collapsed")
+    if auto_refresh:
+        _time_mod.sleep(ar_interval)
+        st.rerun()
+
+    # ── Monitor Control ───────────────────────────────────────────────────────
+    running = is_monitor_running()
+    mc1, mc2, mc3, mc4 = st.columns(4)
+
+    if mc1.button("▶ Start Monitor", type="primary",
+                  disabled=running, use_container_width=True):
+        start_monitor(interval_min=check_interval)
+        st.rerun()
+
+    if mc2.button("⏹ Stop", disabled=not running, use_container_width=True):
+        stop_monitor()
         _time_mod.sleep(0.3)
         st.rerun()
 
-    if cc2.button("⏹ Stop", disabled=not running, use_container_width=True):
-        stop_monitor()
-        st.info("Monitor กำลังหยุด...")
-        _time_mod.sleep(0.5)
-        st.rerun()
-
-    if cc3.button("⚡ Check Now", use_container_width=True):
-        with st.spinner("กำลังตรวจสัญญาณ..."):
+    if mc3.button("⚡ Check Now", use_container_width=True):
+        with st.spinner("กำลังตรวจสัญญาณ…"):
             try:
                 check_now_once()
                 st.cache_data.clear()
@@ -383,623 +261,405 @@ with tab_live:
                 st.error(f"Error: {e}")
         st.rerun()
 
-    if cc4.button("🔄 Refresh", key="refresh_live_monitor", use_container_width=True):
+    if mc4.button("🔄 Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-    # Monitor status badge
-    restarts = _monitor_meta.get("restart_count", 0)
+    # Status bar
+    rc = _monitor_meta.get("restart_count", 0)
     if running:
-        status_html = (
+        bar = (
             f'<span style="color:#a6e3a1;font-weight:700">● RUNNING</span>'
-            f' &nbsp; ตรวจทุก {_monitor_meta["interval"]} นาที'
-            f' &nbsp;|&nbsp; Last: {_monitor_meta["last_check"] or "กำลังตรวจครั้งแรก…"}'
-            f' &nbsp;|&nbsp; Next: {_monitor_meta["next_check"] or "—"}'
-            + (f' &nbsp;|&nbsp; Restarts: {restarts}' if restarts > 1 else '')
+            f' — ตรวจทุก {_monitor_meta["interval"]} นาที'
+            f' | Last: <b>{_monitor_meta["last_check"] or "กำลังตรวจ…"}</b>'
+            f' | Next: {_monitor_meta["next_check"] or "—"}'
+            + (f' | Restarts: {rc}' if rc > 1 else '')
         )
     else:
-        status_html = '<span style="color:#6c7086;font-weight:700">○ STOPPED</span> &nbsp; (จะ auto-start เมื่อกด ▶ Start ครั้งแรก)'
+        bar = '<span style="color:#6c7086;font-weight:700">○ STOPPED</span>'
     if _monitor_meta.get("error"):
-        status_html += f' &nbsp;|&nbsp; <span style="color:#f38ba8">⚠ {_monitor_meta["error"]} — retrying…</span>'
+        bar += f' | <span style="color:#f38ba8">⚠ {_monitor_meta["error"]} — retrying…</span>'
 
     st.markdown(
         f'<div style="background:#181825;border-radius:8px;padding:8px 16px;'
-        f'margin:6px 0 16px 0;font-size:0.9em">{status_html}</div>',
+        f'margin:6px 0 20px 0;font-size:0.88em">{bar}</div>',
         unsafe_allow_html=True,
     )
+
     st.divider()
 
-    # ── Load trades.json ──────────────────────────────────────────────────────
-    @st.cache_data(ttl=10)
-    def load_trades_json() -> dict | None:
-        if TRADES_FILE.exists():
-            with open(TRADES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return None
+    # ── Load latest signal from signals.json ──────────────────────────────────
+    sig_state = load_signals_json()
 
-    trade_state = load_trades_json()
+    # ── Current signal card ───────────────────────────────────────────────────
+    if sig_state:
+        sig   = sig_state.get("last_signal", "—")
+        price = sig_state.get("last_price") or 0
+        rsi_v = sig_state.get("last_rsi") or 0
+        ma_fv = sig_state.get("last_ma_fast") or 0
+        ma_sv = sig_state.get("last_ma_slow") or 0
+        ma_tv = sig_state.get("last_ma_trend") or 0
+        chk   = sig_state.get("last_checked", "—")
+        algo  = sig_state.get("algorithm_used", "—")
+        reason = sig_state.get("signal_reason", "—")
 
-    if trade_state is None:
-        st.info("ยังไม่มีข้อมูล — กด **⚡ Check Now** หรือ **▶ Start** เพื่อเริ่มตรวจสัญญาณ")
-    else:
-        # ── Current position card ──────────────────────────────────────────────
-        lp = trade_state.get("last_price") or 0.0
-        pos = trade_state.get("state", "CASH")
-        cash = trade_state.get("cash", 0.0)
-        oz   = trade_state.get("oz_held", 0.0)
-        ep   = trade_state.get("entry_price") or 0.0
-        pv   = cash if pos == "CASH" else oz * lp
-        initial_cap = 100.0  # ใช้ค่า default (trades.json ไม่เก็บ initial_capital)
-        ret  = (pv - initial_cap) / initial_cap * 100 if initial_cap else 0
-
-        pos_color = "#a6e3a1" if pos == "GOLD" else "#89b4fa"
-        pos_icon  = "🟡" if pos == "GOLD" else "💵"
+        colors = {"BUY": "#a6e3a1", "SELL": "#f38ba8", "HOLD": "#89b4fa"}
+        icons  = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}
+        c      = colors.get(sig, "#cdd6f4")
+        ic     = icons.get(sig, "⬜")
 
         st.markdown(f"""
-        <div style="background:#1e1e2e;border:1px solid {pos_color}44;
-                    border-radius:12px;padding:20px 28px;margin-bottom:16px">
-          <span style="font-size:1.5em;font-weight:700;color:{pos_color}">
-            {pos_icon} Position: {pos}
+        <div class="signal-card" style="background:linear-gradient(135deg,#1e1e2e,#313244);
+             border:2px solid {c}66">
+          <span style="font-size:2em;font-weight:800;color:{c}">{ic} {sig}</span>
+          &nbsp;&nbsp;
+          <span style="color:#cdd6f4;font-size:1.1em">XAU/USD &nbsp;|&nbsp;
+            <b>${price:,.2f}</b>
           </span><br>
-          <span style="color:#cdd6f4;font-size:0.95em">
-            Portfolio: <b>${pv:.2f}</b> &nbsp;|&nbsp;
-            Return: <b style="color:{'#a6e3a1' if ret>=0 else '#f38ba8'}">{ret:+.2f}%</b>
-            &nbsp;|&nbsp; Last price: <b>${lp:,.2f}</b>
+          <span style="color:#6c7086;font-size:0.88em">
+            ตรวจล่าสุด: {chk} &nbsp;|&nbsp; Algorithm: <b style="color:{c}">{algo}</b>
           </span>
         </div>
         """, unsafe_allow_html=True)
 
-        # ── Position detail ────────────────────────────────────────────────────
-        pc1, pc2, pc3, pc4 = st.columns(4)
-        pc1.metric("State",       pos)
-        pc2.metric("Cash",        f"${cash:.2f}")
-        pc3.metric("Portfolio",   f"${pv:.2f}", f"{ret:+.2f}%")
-        if pos == "GOLD" and ep and lp:
-            unreal = (lp - ep) / ep * 100
-            pc4.metric("Unrealized P&L",
-                       f"${(lp - ep)*oz:.2f}",
-                       f"{unreal:+.2f}% vs entry ${ep:,.2f}",
-                       delta_color="normal" if unreal >= 0 else "inverse")
+        # Key metrics
+        km1, km2, km3, km4, km5 = st.columns(5)
+        km1.metric("XAU/USD",       f"${price:,.2f}")
+        km2.metric(f"RSI({rsi_buy}/<{rsi_sell})", f"{rsi_v:.1f}",
+                   "Oversold" if rsi_v < rsi_buy else ("Overbought" if rsi_v > rsi_sell else "Neutral"))
+        km3.metric(f"MA{ma_fast}",  f"{ma_fv:,.0f}")
+        km4.metric(f"MA{ma_slow}",  f"{ma_sv:,.0f}")
+        km5.metric(f"MA{ma_trend}", f"{ma_tv:,.0f}")
+    else:
+        st.info("กด **⚡ Check Now** หรือ **▶ Start Monitor** เพื่อดูสัญญาณ")
+        sig = None
+
+    st.divider()
+
+    # ── Chart ─────────────────────────────────────────────────────────────────
+    st.subheader("📈 Chart — XAU/USD + Indicators")
+
+    with st.spinner("Loading chart data…"):
+        try:
+            df = cached_fetch(data_days, float(rsi_buy), float(rsi_sell),
+                              ma_fast, ma_slow, ma_trend)
+        except Exception as e:
+            st.error(f"ดึงข้อมูลไม่ได้: {e}")
+            df = None
+
+    if df is not None and len(df) > 0:
+        # ── BUY/SELL markers จาก signal history ──────────────────────────────
+        hist = (sig_state or {}).get("history", [])
+        buy_dates  = [h["date"][:10] for h in hist if h["signal"] == "BUY"]
+        sell_dates = [h["date"][:10] for h in hist if h["signal"] == "SELL"]
+        buy_prices  = [h["price"] for h in hist if h["signal"] == "BUY"]
+        sell_prices = [h["price"] for h in hist if h["signal"] == "SELL"]
+
+        # ── 2-panel chart ─────────────────────────────────────────────────────
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            row_heights=[0.7, 0.3],
+            vertical_spacing=0.04,
+            subplot_titles=("XAU/USD Price + Moving Averages", f"RSI({rsi_buy}/{rsi_sell})"),
+        )
+
+        # Panel 1: Price
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["Close"],
+            name="XAU/USD", line=dict(color="#f9e2af", width=1.8),
+        ), row=1, col=1)
+
+        ma_colors = {
+            f"MA{ma_fast}":  "#89b4fa",   # blue
+            f"MA{ma_slow}":  "#fab387",   # orange
+            f"MA{ma_trend}": "#f38ba8",   # red
+        }
+        for col_name, color in ma_colors.items():
+            if col_name in df.columns:
+                fig.add_trace(go.Scatter(
+                    x=df.index, y=df[col_name],
+                    name=col_name, line=dict(color=color, width=1.2, dash="dot"),
+                ), row=1, col=1)
+
+        # BUY markers
+        if buy_dates:
+            fig.add_trace(go.Scatter(
+                x=buy_dates, y=buy_prices,
+                name="BUY Signal",
+                mode="markers",
+                marker=dict(symbol="triangle-up", size=14, color="#a6e3a1",
+                            line=dict(color="#1e1e2e", width=1)),
+            ), row=1, col=1)
+
+        # SELL markers
+        if sell_dates:
+            fig.add_trace(go.Scatter(
+                x=sell_dates, y=sell_prices,
+                name="SELL Signal",
+                mode="markers",
+                marker=dict(symbol="triangle-down", size=14, color="#f38ba8",
+                            line=dict(color="#1e1e2e", width=1)),
+            ), row=1, col=1)
+
+        # Panel 2: RSI
+        if "RSI" in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df["RSI"],
+                name="RSI", line=dict(color="#cba6f7", width=1.5),
+            ), row=2, col=1)
+
+            # Oversold / Overbought zones
+            fig.add_hrect(y0=0,        y1=rsi_buy,  row=2, col=1,
+                          fillcolor="rgba(166,227,161,0.08)", line_width=0)
+            fig.add_hrect(y0=rsi_sell, y1=100,      row=2, col=1,
+                          fillcolor="rgba(243,139,168,0.08)", line_width=0)
+            fig.add_hline(y=rsi_buy,  row=2, col=1,
+                          line=dict(color="#a6e3a1", width=1, dash="dash"),
+                          annotation_text=f"Buy {rsi_buy}", annotation_position="left")
+            fig.add_hline(y=rsi_sell, row=2, col=1,
+                          line=dict(color="#f38ba8", width=1, dash="dash"),
+                          annotation_text=f"Sell {rsi_sell}", annotation_position="left")
+            fig.add_hline(y=50, row=2, col=1,
+                          line=dict(color="#6c7086", width=0.7, dash="dot"))
+
+        fig.update_layout(
+            height=600,
+            template="plotly_dark",
+            paper_bgcolor="#1e1e2e",
+            plot_bgcolor="#1e1e2e",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1, bgcolor="rgba(0,0,0,0)"),
+            margin=dict(t=60, b=20, l=0, r=0),
+            hovermode="x unified",
+            xaxis=dict(rangeslider=dict(visible=False), gridcolor="#313244"),
+            yaxis=dict(gridcolor="#313244"),
+            xaxis2=dict(gridcolor="#313244"),
+            yaxis2=dict(gridcolor="#313244", range=[0, 100]),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ── Algorithm Explanation ─────────────────────────────────────────────────
+    st.subheader("🧮 Algorithm Breakdown")
+
+    if sig_state:
+        reason = sig_state.get("signal_reason", "—")
+        algo   = sig_state.get("algorithm_used", "—")
+        rsi_v  = sig_state.get("last_rsi") or 0
+        ma_fv  = sig_state.get("last_ma_fast") or 0
+        ma_sv  = sig_state.get("last_ma_slow") or 0
+        ma_tv  = sig_state.get("last_ma_trend") or 0
+
+        # RSI condition
+        rsi_fired = algo == "RSI"
+        if rsi_v < rsi_buy:
+            rsi_status = f"🟢 BUY — Oversold ({rsi_v:.1f} < {rsi_buy})"
+            rsi_col    = "#a6e3a1"
+        elif rsi_v > rsi_sell:
+            rsi_status = f"🔴 SELL — Overbought ({rsi_v:.1f} > {rsi_sell})"
+            rsi_col    = "#f38ba8"
         else:
-            pc4.metric("Oz Held", f"{oz:.5f}")
+            rsi_status = f"⚪ HOLD — Neutral ({rsi_v:.1f} อยู่ใน {rsi_buy}–{rsi_sell})"
+            rsi_col    = "#6c7086"
 
-        # ── Last signal status ─────────────────────────────────────────────────
-        last_sig   = trade_state.get("last_signal", "—")
-        last_check = trade_state.get("last_checked", "—")
-        last_rsi   = trade_state.get("last_rsi")
+        # MA condition
+        ma_fired = "MA" in algo
+        if "ข้ามขึ้น" in reason and "MA" in algo:
+            ma_status = f"🟢 BUY — MA{ma_fast} ข้ามขึ้นเหนือ MA{ma_slow} + ราคาเหนือ MA{ma_trend}"
+            ma_col    = "#a6e3a1"
+        elif "ข้ามลง" in reason and "MA" in algo:
+            ma_status = f"🔴 SELL — MA{ma_fast} ข้ามลงใต้ MA{ma_slow}"
+            ma_col    = "#f38ba8"
+        else:
+            ma_status = f"⚪ HOLD — ไม่มี MA Crossover"
+            ma_col    = "#6c7086"
 
-        sig_colors = {"BUY": "#a6e3a1", "SELL": "#f38ba8",
-                      "HOLD": "#cdd6f4", "ERROR": "#fab387", "WARM-UP": "#6c7086"}
-        sig_col = sig_colors.get(last_sig, "#cdd6f4")
+        col_a, col_b = st.columns(2)
 
+        with col_a:
+            border_a = "#f9e2af44" if rsi_fired else "#31324466"
+            st.markdown(f"""
+            <div class="algo-card" style="border-color:{border_a}">
+              <div style="font-size:1.1em;font-weight:700;margin-bottom:10px">
+                📊 Algorithm 1: RSI
+                {'&nbsp;<span style="background:#f9e2af22;color:#f9e2af;'
+                 'font-size:0.7em;padding:2px 8px;border-radius:99px">✅ WINNER</span>'
+                 if rsi_fired else ''}
+              </div>
+              <div style="color:{rsi_col};font-size:1em;font-weight:600">{rsi_status}</div>
+              <hr style="border-color:#31324466;margin:10px 0">
+              <div style="color:#6c7086;font-size:0.85em">
+                RSI วัด momentum ของราคา<br>
+                &lt; {rsi_buy} = Oversold → สัญญาณ <b>BUY</b><br>
+                &gt; {rsi_sell} = Overbought → สัญญาณ <b>SELL</b><br>
+                ค่าปัจจุบัน: <b style="color:#cdd6f4">{rsi_v:.1f}</b>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col_b:
+            border_b = "#f9e2af44" if ma_fired else "#31324466"
+            st.markdown(f"""
+            <div class="algo-card" style="border-color:{border_b}">
+              <div style="font-size:1.1em;font-weight:700;margin-bottom:10px">
+                📈 Algorithm 2: MA Crossover
+                {'&nbsp;<span style="background:#f9e2af22;color:#f9e2af;'
+                 'font-size:0.7em;padding:2px 8px;border-radius:99px">✅ WINNER</span>'
+                 if ma_fired else ''}
+              </div>
+              <div style="color:{ma_col};font-size:1em;font-weight:600">{ma_status}</div>
+              <hr style="border-color:#31324466;margin:10px 0">
+              <div style="color:#6c7086;font-size:0.85em">
+                MA{ma_fast}={ma_fv:,.0f} &nbsp;/&nbsp;
+                MA{ma_slow}={ma_sv:,.0f} &nbsp;/&nbsp;
+                MA{ma_trend}={ma_tv:,.0f}<br>
+                MA{ma_fast} ข้ามขึ้นเหนือ MA{ma_slow} + ราคา &gt; MA{ma_trend} → <b>BUY</b><br>
+                MA{ma_fast} ข้ามลงใต้ MA{ma_slow} → <b>SELL</b><br>
+                (RSI wins ถ้า RSI มีสัญญาณด้วย)
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Final decision arrow
+        sig_now = sig_state.get("last_signal", "HOLD")
+        c_now   = colors.get(sig_now, "#cdd6f4")
         st.markdown(f"""
-        <div style="background:#181825;border-radius:8px;padding:12px 20px;
-                    border-left:4px solid {sig_col};margin:8px 0">
-          <b style="color:{sig_col};font-size:1.1em">{last_sig}</b>
-          &nbsp;&nbsp;<span style="color:#6c7086;font-size:0.85em">
-            Last checked: {last_check} &nbsp;|&nbsp;
-            RSI: {f"{last_rsi:.1f}" if last_rsi is not None else "—"}
-          </span>
+        <div style="background:#181825;border-radius:10px;padding:14px 20px;
+                    margin-top:12px;border-left:4px solid {c_now}">
+          <b>🏆 Final Decision: <span style="color:{c_now}">{sig_now}</span></b>
+          &nbsp;&nbsp;|&nbsp;&nbsp;
+          Triggered by: <b>{algo or "ไม่มีสัญญาณชัดเจน"}</b>
+          <br><span style="color:#6c7086;font-size:0.88em">{reason}</span>
         </div>
         """, unsafe_allow_html=True)
 
-        # ── Trade history table ────────────────────────────────────────────────
-        st.divider()
-        trades = trade_state.get("trades", [])
-        if trades:
-            st.subheader(f"📋 Trade History ({len(trades)} entries)")
+        # Tie-break rule
+        with st.expander("ℹ️ กฎ Tie-break: เมื่อทั้ง 2 algorithm ให้สัญญาณ"):
+            st.markdown(f"""
+| สถานการณ์ | ผลลัพธ์ |
+|-----------|---------|
+| RSI = BUY, MA = HOLD | **BUY** (RSI wins) |
+| RSI = HOLD, MA = BUY | **BUY** (MA wins) |
+| RSI = BUY, MA = BUY  | **BUY** (ตรงกัน) |
+| RSI = SELL, MA = BUY | **SELL** (RSI wins) |
+| RSI = BUY, MA = SELL | **BUY** (RSI wins) |
+| RSI = HOLD, MA = HOLD | **HOLD** |
 
+**RSI มีความสำคัญสูงกว่า MA** เพราะวัด momentum ได้เร็วกว่า
+            """)
+    else:
+        st.info("ยังไม่มีข้อมูล — กด **⚡ Check Now** ก่อน")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 2 — SIGNAL HISTORY
+# ═════════════════════════════════════════════════════════════════════════════
+
+with tab_history:
+    st.subheader("📋 Signal History")
+
+    sig_state2 = load_signals_json()
+
+    if sig_state2 is None or not sig_state2.get("history"):
+        st.info("ยังไม่มี history — รอ Monitor ทำงานสักครู่")
+    else:
+        hist = sig_state2["history"]
+
+        # ── Filter ────────────────────────────────────────────────────────────
+        fc1, fc2 = st.columns([2, 4])
+        filter_sig = fc1.multiselect(
+            "กรอง Signal", ["BUY", "SELL", "HOLD"],
+            default=["BUY", "SELL", "HOLD"],
+        )
+        filtered = [h for h in hist if h.get("signal") in filter_sig]
+
+        st.caption(f"แสดง {len(filtered)} รายการ จาก {len(hist)} ทั้งหมด")
+
+        if filtered:
             rows = []
-            for t in reversed(trades):   # ล่าสุดขึ้นก่อน
-                dt_s  = str(t.get("date", ""))[:19].replace("T", " ")
-                pnl_u = f"{t['pnl_usd']:+.2f}" if t.get("pnl_usd") is not None else "—"
-                pnl_p = f"{t['pnl_pct']:+.2f}%" if t.get("pnl_pct") is not None else "—"
-                dur   = f"{t['duration']}d" if t.get("duration") is not None else "—"
+            for h in reversed(filtered):
+                sig_h = h.get("signal", "—")
+                icon_h = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(sig_h, "")
                 rows.append({
-                    "#":         t.get("id", ""),
-                    "Date":      dt_s,
-                    "Action":    t["action"],
-                    "Price ($)": f"${t['price']:,.2f}",
-                    "Oz":        f"{t.get('oz', 0):.5f}",
-                    "P&L ($)":   pnl_u,
-                    "P&L (%)":   pnl_p,
-                    "Duration":  dur,
-                    "Balance":   f"${t.get('balance', 0):,.2f}",
-                    "Reason":    t.get("reason", ""),
+                    "Date":       str(h.get("date", ""))[:19].replace("T", " "),
+                    "Signal":     f"{icon_h} {sig_h}",
+                    "Price ($)":  f"${h.get('price', 0):,.2f}",
+                    "RSI":        f"{h.get('rsi', 0):.1f}",
+                    f"MA{ma_fast}":  f"{h.get('ma_fast', 0):,.0f}",
+                    f"MA{ma_slow}":  f"{h.get('ma_slow', 0):,.0f}",
+                    f"MA{ma_trend}": f"{h.get('ma_trend', 0):,.0f}",
+                    "Algorithm":  h.get("algorithm", "—"),
+                    "Reason":     h.get("reason", ""),
                 })
 
             hist_df = pd.DataFrame(rows)
 
-            def _live_row_style(row):
-                act = row["Action"]
-                pnl = str(row.get("P&L ($)", ""))
-                if act == "BUY":
-                    return ["background-color:rgba(166,227,161,0.07)"] * len(row)
-                elif act == "SELL":
-                    c = "rgba(166,227,161,0.13)" if "+" in pnl else "rgba(243,139,168,0.13)"
-                    return [f"background-color:{c}"] * len(row)
+            def _row_style(row):
+                s = str(row.get("Signal", ""))
+                if "BUY"  in s: return ["background:rgba(166,227,161,0.07)"] * len(row)
+                if "SELL" in s: return ["background:rgba(243,139,168,0.07)"] * len(row)
                 return [""] * len(row)
 
             st.dataframe(
-                hist_df.style.apply(_live_row_style, axis=1),
-                use_container_width=True, hide_index=True,
+                hist_df.style.apply(_row_style, axis=1),
+                use_container_width=True,
+                hide_index=True,
             )
 
-            # ── Stats summary ──────────────────────────────────────────────────
-            sells   = [t for t in trades if t["action"] == "SELL"]
-            wins    = sum(1 for t in sells if (t.get("pnl_usd") or 0) > 0)
-            total_p = sum(t.get("pnl_usd") or 0 for t in sells)
-            n_s     = len(sells)
-            avg_dur = (sum(t.get("duration") or 0 for t in sells) / n_s) if n_s else 0
+            # ── Mini signal timeline chart ─────────────────────────────────────
+            st.divider()
+            st.markdown("**Signal Timeline**")
 
-            if sells:
-                st.divider()
-                st.subheader("📊 Live Trading Stats")
-                sc1, sc2, sc3, sc4 = st.columns(4)
-                sc1.metric("Closed Trades",  n_s)
-                sc2.metric("Win Rate",       f"{wins/n_s*100:.1f}%",  f"{wins}W / {n_s-wins}L")
-                sc3.metric("Total P&L",      f"${total_p:+.2f}")
-                sc4.metric("Avg Duration",   f"{avg_dur:.1f} days")
-
-                # P&L equity curve from live trades
-                if n_s >= 2:
-                    cum_bal = []
-                    bal = 100.0
-                    for t in [x for x in trades if x["action"] in ("SELL",)]:
-                        bal += t.get("pnl_usd") or 0
-                        cum_bal.append({
-                            "date":  str(t["date"])[:10],
-                            "value": bal,
-                            "pnl":   t.get("pnl_usd", 0),
-                        })
-                    if cum_bal:
-                        eq_df = pd.DataFrame(cum_bal)
-                        fig_eq = go.Figure()
-                        fig_eq.add_trace(go.Scatter(
-                            x=eq_df["date"], y=eq_df["value"],
-                            mode="lines+markers", name="Balance",
-                            line=dict(color="#f9e2af", width=2),
-                            marker=dict(size=8,
-                                        color=["#a6e3a1" if v >= 0 else "#f38ba8"
-                                               for v in eq_df["pnl"]]),
+            non_hold_h = [h for h in filtered if h.get("signal") in ("BUY", "SELL")]
+            if len(non_hold_h) >= 1:
+                tl_fig = go.Figure()
+                for sig_type, color, symbol in [
+                    ("BUY",  "#a6e3a1", "triangle-up"),
+                    ("SELL", "#f38ba8", "triangle-down"),
+                ]:
+                    pts = [h for h in non_hold_h if h.get("signal") == sig_type]
+                    if pts:
+                        tl_fig.add_trace(go.Scatter(
+                            x=[p["date"][:10] for p in pts],
+                            y=[p["price"]     for p in pts],
+                            name=sig_type,
+                            mode="markers+text",
+                            text=[sig_type] * len(pts),
+                            textposition="top center",
+                            marker=dict(symbol=symbol, size=14, color=color),
                         ))
-                        fig_eq.add_hline(y=100, line_dash="dash",
-                                         line_color="rgba(255,255,255,0.2)")
-                        fig_eq.update_layout(
-                            title="Live Portfolio Balance ($)",
-                            height=260, template="plotly_dark",
-                            paper_bgcolor="#1e1e2e", plot_bgcolor="#1e1e2e",
-                            margin=dict(t=40, b=10),
-                            yaxis=dict(gridcolor="#313244"),
-                            xaxis=dict(gridcolor="#313244"),
-                        )
-                        st.plotly_chart(fig_eq, use_container_width=True)
-        else:
-            st.info("ยังไม่มี trade ถูกบันทึก — รอ BUY signal แรก")
 
-        # ── Alternative: CLI ──────────────────────────────────────────────────
-        with st.expander("🖥️ รันจาก terminal แทน (ทางเลือก)", expanded=False):
-            st.markdown("""
-Monitor จะรันใน **background thread ของ Streamlit** โดยอัตโนมัติ (กด ▶ Start)
-แต่ถ้าต้องการรันแยก process ก็ทำได้:
+                tl_fig.update_layout(
+                    height=220, template="plotly_dark",
+                    paper_bgcolor="#1e1e2e", plot_bgcolor="#1e1e2e",
+                    margin=dict(t=10, b=20, l=0, r=0),
+                    showlegend=True,
+                    yaxis=dict(title="Price ($)", gridcolor="#313244"),
+                    xaxis=dict(gridcolor="#313244"),
+                )
+                st.plotly_chart(tl_fig, use_container_width=True)
 
-```bash
-# รันต่อเนื่อง
-python live_monitor.py
+            # ── Stats ──────────────────────────────────────────────────────────
+            st.divider()
+            st.subheader("📊 Statistics")
+            total   = len(hist)
+            n_buy   = sum(1 for h in hist if h.get("signal") == "BUY")
+            n_sell  = sum(1 for h in hist if h.get("signal") == "SELL")
+            n_hold  = sum(1 for h in hist if h.get("signal") == "HOLD")
 
-# รันครั้งเดียว (GitHub Actions / cron)
-python live_monitor.py --once
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("Total Checks", total)
+            sc2.metric("BUY signals",  n_buy)
+            sc3.metric("SELL signals", n_sell)
+            sc4.metric("HOLD signals", n_hold)
 
-# ดู status
-python live_monitor.py --status
-```
-            """)
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  TAB 2 — BACKTEST SIMULATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-with tab_sim:
-
-    # ── Live price bar ────────────────────────────────────────────────────────
-    live = get_live_price()
-    lc1, lc2, lc3, lc4 = st.columns([2, 1, 1, 2])
-    if live["ok"]:
-        lc1.metric(
-            "XAU/USD (latest close)",
-            f"${live['price']:,.2f}",
-            f"{live['change']:+.2f} ({live['change_pct']:+.2f}%)",
-            delta_color="normal" if live["change"] >= 0 else "inverse",
-        )
-        lc2.metric("Date",   live["date"])
-        lc3.metric("Source", live.get("source", "yfinance"))
-    else:
-        lc1.warning("Live price unavailable")
-    lc4.caption(f"Cache 60s · {datetime.now().strftime('%H:%M:%S')}")
-    st.divider()
-
-    # ── Load / run simulation ─────────────────────────────────────────────────
-    if "results_loaded" not in st.session_state:
-        st.session_state["results_loaded"] = False
-
-    if run_btn or not st.session_state["results_loaded"]:
-        try:
-            cfg, df_raw, df, tlog, ecurve, metrics = cached_run(
-                initial_capital, transaction_cost,
-                rsi_buy, rsi_sell, ma_fast, ma_slow, ma_trend,
-            )
-            st.session_state.update({
-                "cfg": cfg, "df_raw": df_raw, "df": df,
-                "tlog": tlog, "ecurve": ecurve, "metrics": metrics,
-                "results_loaded": True,
-                "sweep_df": None, "wf_results": None, "mc": None,
-            })
-        except Exception as e:
-            st.error(f"Simulation failed: {e}")
-            st.stop()
-
-    cfg     = st.session_state["cfg"]
-    df_raw  = st.session_state["df_raw"]
-    df      = st.session_state["df"]
-    tlog    = st.session_state["tlog"]
-    ecurve  = st.session_state["ecurve"]
-    metrics = st.session_state["metrics"]
-
-    # ── KEY METRICS ───────────────────────────────────────────────────────────
-    st.subheader("📈 Performance Summary")
-    ret_pct  = metrics.get("total_return_pct", 0)
-    bh_pct   = metrics.get("buy_hold_return_pct", 0)
-    alpha    = metrics.get("alpha_pct", 0)
-    win_rate = metrics.get("win_rate_pct", 0)
-    sharpe   = metrics.get("sharpe_ratio", 0)
-    max_dd   = metrics.get("max_drawdown_pct", 0)
-    final_b  = metrics.get("final_balance", initial_capital)
-    n_wins   = metrics.get("num_wins", 0)
-    n_loss   = metrics.get("num_losses", 0)
-    n_closed = metrics.get("num_closed", 0)
-
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Final Balance",  f"${final_b:.2f}",   f"{ret_pct:+.2f}%")
-    m2.metric("Total Return",   f"{ret_pct:+.2f}%",  f"B&H: {bh_pct:+.1f}%")
-    m3.metric("Alpha",          f"{alpha:+.2f}%",    "vs buy-and-hold")
-    m4.metric("Win Rate",       f"{win_rate:.1f}%",  f"{n_wins}W / {n_loss}L")
-    m5.metric("Sharpe Ratio",   f"{sharpe:.2f}",     "annualised")
-    m6.metric("Max Drawdown",   f"-{max_dd:.1f}%",   f"{n_closed} closed trades")
-
-    if metrics.get("low_trade_warning"):
-        st.warning("⚠️ Less than 5 closed trades — lower RSI thresholds to generate more signals.")
-
-    # ── EQUITY CURVE ──────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("💹 Portfolio Equity Curve")
-
-    if ecurve:
-        ec_df = pd.DataFrame(ecurve)
-        ec_df["date"] = pd.to_datetime(ec_df["date"])
-        sim_df    = df.iloc[cfg.lookback_required:].copy()
-        bh_prices = sim_df["Close"].values
-        bh_norm   = bh_prices / bh_prices[0] * initial_capital if len(bh_prices) > 0 else []
-        ec_lookup = {pd.Timestamp(e["date"]): e["value"] for e in ecurve}
-
-        fig = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.65, 0.35], vertical_spacing=0.04,
-            subplot_titles=("Portfolio Value vs Buy-and-Hold ($)", "XAU/USD Price"),
-        )
-        fig.add_trace(go.Scatter(
-            x=ec_df["date"], y=ec_df["value"], name="Strategy",
-            line=dict(color="#f9e2af", width=2),
-            fill="tozeroy", fillcolor="rgba(249,226,175,0.06)",
-            hovertemplate="$%{y:.2f}<extra>Strategy</extra>",
-        ), row=1, col=1)
-        if len(bh_norm) > 0:
-            fig.add_trace(go.Scatter(
-                x=sim_df.index[:len(bh_norm)], y=bh_norm, name="Buy & Hold",
-                line=dict(color="#6c7086", width=1.5, dash="dot"),
-                hovertemplate="$%{y:.2f}<extra>Buy & Hold</extra>",
-            ), row=1, col=1)
-        fig.add_hline(y=initial_capital, line_dash="dash",
-                      line_color="rgba(255,255,255,0.2)", row=1, col=1)
-
-        buy_trades  = [t for t in tlog if t["action"] == "BUY"]
-        sell_trades = [t for t in tlog if t["action"] in ("SELL", "OPEN")]
-        if buy_trades:
-            bx = [pd.Timestamp(t["date"]) for t in buy_trades]
-            by = [ec_lookup.get(pd.Timestamp(t["date"]),
-                                _ecurve_value_at(ecurve, t["date"])) for t in buy_trades]
-            fig.add_trace(go.Scatter(
-                x=bx, y=by, mode="markers", name="BUY",
-                marker=dict(symbol="triangle-up", size=13, color="#a6e3a1",
-                            line=dict(width=1, color="#1e1e2e")),
-                hovertemplate="BUY @ $%{y:.2f}<extra></extra>",
-            ), row=1, col=1)
-        if sell_trades:
-            sx = [pd.Timestamp(t["date"]) for t in sell_trades]
-            sy = [ec_lookup.get(pd.Timestamp(t["date"]),
-                                _ecurve_value_at(ecurve, t["date"])) for t in sell_trades]
-            sc = ["#a6e3a1" if (t.get("pnl_usd") or 0) >= 0 else "#f38ba8" for t in sell_trades]
-            fig.add_trace(go.Scatter(
-                x=sx, y=sy, mode="markers", name="SELL",
-                marker=dict(symbol="triangle-down", size=13, color=sc,
-                            line=dict(width=1, color="#1e1e2e")),
-                hovertemplate="SELL @ $%{y:.2f}<extra></extra>",
-            ), row=1, col=1)
-
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["Close"], name="XAU/USD",
-            line=dict(color="#cdd6f4", width=1),
-            hovertemplate="$%{y:,.2f}<extra>XAU/USD</extra>",
-        ), row=2, col=1)
-
-        rsi_clean = df[df["RSI"].notna()]
-        for zone_df, zname, zcol in [
-            (rsi_clean[rsi_clean["RSI"] < cfg.rsi_buy_threshold],
-             f"RSI<{cfg.rsi_buy_threshold}", "#a6e3a1"),
-            (rsi_clean[rsi_clean["RSI"] > cfg.rsi_sell_threshold],
-             f"RSI>{cfg.rsi_sell_threshold}", "#f38ba8"),
-        ]:
-            if not zone_df.empty:
-                fig.add_trace(go.Scatter(
-                    x=zone_df.index, y=zone_df["Close"], mode="markers", name=zname,
-                    marker=dict(size=5, color=zcol, opacity=0.6),
-                ), row=2, col=1)
-
-        fig.update_layout(
-            height=580, template="plotly_dark",
-            paper_bgcolor="#1e1e2e", plot_bgcolor="#1e1e2e",
-            legend=dict(orientation="h", y=-0.08, x=0),
-            margin=dict(t=40, b=10, l=60, r=20), hovermode="x unified",
-        )
-        fig.update_yaxes(title_text="USD ($)",  row=1, col=1, gridcolor="#313244")
-        fig.update_yaxes(title_text="XAU/USD", row=2, col=1, gridcolor="#313244")
-        fig.update_xaxes(gridcolor="#313244")
-        st.plotly_chart(fig, use_container_width=True)
-
-    # ── RSI + MA ──────────────────────────────────────────────────────────────
-    with st.expander("📉 RSI & Moving Averages", expanded=False):
-        tab_rsi, tab_ma = st.tabs(["RSI(14)", "Moving Averages"])
-        with tab_rsi:
-            rsi_data = df[df["RSI"].notna()]
-            fig_rsi  = go.Figure()
-            fig_rsi.add_trace(go.Scatter(x=rsi_data.index, y=rsi_data["RSI"],
-                                         name="RSI(14)", line=dict(color="#cba6f7", width=1.5)))
-            fig_rsi.add_hrect(y0=0, y1=cfg.rsi_buy_threshold,
-                              fillcolor="rgba(166,227,161,0.08)", line_width=0)
-            fig_rsi.add_hrect(y0=cfg.rsi_sell_threshold, y1=100,
-                              fillcolor="rgba(243,139,168,0.08)", line_width=0)
-            fig_rsi.add_hline(y=cfg.rsi_buy_threshold, line_dash="dash", line_color="#a6e3a1",
-                              annotation_text=f"Buy < {cfg.rsi_buy_threshold}")
-            fig_rsi.add_hline(y=cfg.rsi_sell_threshold, line_dash="dash", line_color="#f38ba8",
-                              annotation_text=f"Sell > {cfg.rsi_sell_threshold}")
-            fig_rsi.add_hline(y=50, line_dash="dot", line_color="rgba(255,255,255,0.15)")
-            fig_rsi.update_layout(height=260, template="plotly_dark",
-                                  paper_bgcolor="#1e1e2e", plot_bgcolor="#1e1e2e",
-                                  margin=dict(t=10, b=10),
-                                  yaxis=dict(range=[0, 100], gridcolor="#313244"),
-                                  xaxis=dict(gridcolor="#313244"))
-            st.plotly_chart(fig_rsi, use_container_width=True)
-        with tab_ma:
-            fig_ma = go.Figure()
-            fig_ma.add_trace(go.Scatter(x=df.index, y=df["Close"], name="XAU/USD",
-                                        line=dict(color="#cdd6f4", width=1), opacity=0.7))
-            for ma_col, ma_color in [(f"MA{cfg.ma_fast}", "#f9e2af"),
-                                     (f"MA{cfg.ma_slow}", "#89b4fa"),
-                                     (f"MA{cfg.ma_trend}", "#f38ba8")]:
-                if ma_col in df.columns:
-                    fig_ma.add_trace(go.Scatter(x=df.index, y=df[ma_col], name=ma_col,
-                                                line=dict(color=ma_color, width=1.5)))
-            fig_ma.update_layout(height=260, template="plotly_dark",
-                                 paper_bgcolor="#1e1e2e", plot_bgcolor="#1e1e2e",
-                                 margin=dict(t=10, b=10),
-                                 yaxis=dict(gridcolor="#313244"), xaxis=dict(gridcolor="#313244"))
-            st.plotly_chart(fig_ma, use_container_width=True)
-
-    # ── TRADE LOG ─────────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("📋 Trade Log")
-    if tlog:
-        rows = []
-        for t in tlog:
-            dt_s  = pd.Timestamp(t["date"]).strftime("%Y-%m-%d")
-            pnl_u = f"{t['pnl_usd']:+.2f}" if t["pnl_usd"] is not None else "—"
-            pnl_p = f"{t['pnl_pct']:+.2f}%" if t["pnl_pct"] is not None else "—"
-            dur   = f"{t.get('duration','—')}d" if t.get("duration") is not None else "—"
-            rows.append({"Date": dt_s, "Action": t["action"],
-                         "Price ($)": f"${t['price']:,.2f}", "Oz": f"{t['oz']:.5f}",
-                         "P&L ($)": pnl_u, "P&L (%)": pnl_p, "Duration": dur,
-                         "Balance ($)": f"${t['balance']:,.2f}"})
-        tlog_df = pd.DataFrame(rows)
-
-        def _row_style(row):
-            act = row["Action"]; pnl = str(row.get("P&L ($)", ""))
-            if act == "BUY":   return ["background-color:rgba(166,227,161,0.07)"] * len(row)
-            if act == "SELL":
-                c = "rgba(166,227,161,0.13)" if "+" in pnl else "rgba(243,139,168,0.13)"
-                return [f"background-color:{c}"] * len(row)
-            if act == "OPEN":  return ["background-color:rgba(249,226,175,0.10)"] * len(row)
-            return [""] * len(row)
-
-        st.dataframe(tlog_df.style.apply(_row_style, axis=1),
-                     use_container_width=True, hide_index=True)
-
-        sell_only = [t for t in tlog if t["action"] in ("SELL","OPEN") and t["pnl_usd"] is not None]
-        if sell_only:
-            pnl_vals   = [t["pnl_usd"] for t in sell_only]
-            pnl_labels = [pd.Timestamp(t["date"]).strftime("%Y-%m-%d") for t in sell_only]
-            fig_pnl = go.Figure(go.Bar(
-                x=pnl_labels, y=pnl_vals,
-                marker_color=["#a6e3a1" if v >= 0 else "#f38ba8" for v in pnl_vals],
-                hovertemplate="$%{y:+.2f}<extra></extra>",
-            ))
-            fig_pnl.add_hline(y=0, line_color="rgba(255,255,255,0.3)")
-            fig_pnl.update_layout(title="P&L per Trade ($)", height=220,
-                                  template="plotly_dark", paper_bgcolor="#1e1e2e",
-                                  plot_bgcolor="#1e1e2e", margin=dict(t=40, b=20),
-                                  showlegend=False,
-                                  yaxis=dict(gridcolor="#313244"), xaxis=dict(gridcolor="#313244"))
-            st.plotly_chart(fig_pnl, use_container_width=True)
-    else:
-        st.info("No trades executed. Try adjusting RSI thresholds.")
-
-    # ── PARAMETER SWEEP ───────────────────────────────────────────────────────
-    if run_sweep:
-        st.divider()
-        st.subheader("🔍 Parameter Sweep")
-        sweep_df = cached_sweep(initial_capital, transaction_cost,
-                                rsi_buy, rsi_sell, ma_fast, ma_slow, ma_trend)
-        st.session_state["sweep_df"] = sweep_df
-        if not sweep_df.empty:
-            sl, sr = st.columns([3, 2])
-            with sl:
-                st.markdown("**Top 15 combinations (sorted by Sharpe)**")
-                disp = sweep_df.head(15).copy().reset_index(drop=True)
-                for c in ["RSI_buy","RSI_sell","MA_fast","MA_slow","Trades"]:
-                    disp[c] = disp[c].astype(int)
-                def _highlight_sweep(row):
-                    if row.name == 0: return ["background-color:rgba(249,226,175,0.18)"]*len(row)
-                    if row.get("Default","")=="*": return ["background-color:rgba(137,180,250,0.12)"]*len(row)
-                    return [""]*len(row)
-                st.dataframe(disp.style.apply(_highlight_sweep, axis=1),
-                             use_container_width=True, hide_index=True)
-            with sr:
-                best = sweep_df.iloc[0]
-                st.markdown("**Best vs Current**")
-                st.metric("Best Sharpe",   f"{float(best['Sharpe']):.2f}",
-                          f"{float(best['Sharpe'])-metrics.get('sharpe_ratio',0):+.2f}")
-                st.metric("Best Return",   f"{float(best['Return%']):+.2f}%")
-                st.metric("Best Win Rate", f"{float(best['WinRate%']):.1f}%")
-                if best.get("Default") != "*":
-                    st.info(f"💡 Suggest: RSI {int(best['RSI_buy'])}/{int(best['RSI_sell'])}, "
-                            f"MA {int(best['MA_fast'])}/{int(best['MA_slow'])}")
-                else:
-                    st.success("Current config is already optimal ✓")
-            pivot = sweep_df.pivot_table(values="Sharpe", index="RSI_buy",
-                                         columns="RSI_sell", aggfunc="max")
-            if not pivot.empty:
-                fig_h = px.imshow(pivot, text_auto=".2f",
-                                  labels=dict(x="RSI Sell", y="RSI Buy", color="Sharpe"),
-                                  color_continuous_scale="RdYlGn",
-                                  title="Sharpe Heatmap (RSI Buy × RSI Sell)")
-                fig_h.update_layout(height=320, template="plotly_dark",
-                                    paper_bgcolor="#1e1e2e", margin=dict(t=40, b=10))
-                st.plotly_chart(fig_h, use_container_width=True)
-
-    # ── WALK-FORWARD ──────────────────────────────────────────────────────────
-    wf_results = None
-    if run_wf:
-        st.divider()
-        st.subheader("🔄 Walk-forward Validation")
-        wf_results = cached_wf(initial_capital, transaction_cost,
-                               rsi_buy, rsi_sell, ma_fast, ma_slow, ma_trend)
-        st.session_state["wf_results"] = wf_results
-        if wf_results:
-            wf_passes = 0
-            wf_cols = st.columns(len(wf_results))
-            for col, r in zip(wf_cols, wf_results):
-                if r["passed"]: wf_passes += 1
-                col.metric(f"Period {r['split']}",
-                           f"{r['return_pct']:+.1f}%", f"Win: {r['win_rate']:.0f}%",
-                           delta_color="normal" if r["return_pct"] >= 0 else "inverse")
-                col.caption(f"{r['period_start']} → {r['period_end']}")
-                col.write("✅ PASS" if r["passed"] else "❌ FAIL")
-            wf_ok = wf_passes >= max(1, len(wf_results) * 2 // 3)
-            (st.success if wf_ok else st.warning)(
-                f"Walk-forward: **{wf_passes}/{len(wf_results)}** periods profitable"
-                + (" — robust ✓" if wf_ok else " — may overfit ✗"))
-
-    # ── MONTE CARLO ───────────────────────────────────────────────────────────
-    mc = None
-    if run_mc:
-        st.divider()
-        st.subheader("🎲 Monte Carlo Simulation")
-        mc = cached_mc(initial_capital, transaction_cost,
-                       rsi_buy, rsi_sell, ma_fast, ma_slow, ma_trend)
-        st.session_state["mc"] = mc
-        if mc.get("n_trades", 0) >= 2:
-            mc1, mc2 = st.columns([2, 1])
-            with mc1:
-                fig_mc = go.Figure()
-                fig_mc.add_trace(go.Histogram(x=mc["distribution"], nbinsx=40,
-                                              marker_color="rgba(137,180,250,0.55)",
-                                              histnorm="probability density", name="Random"))
-                fig_mc.add_vline(x=mc["actual_return_pct"], line_dash="dash",
-                                 line_color="#f9e2af", line_width=2,
-                                 annotation_text=f"Actual: {mc['actual_return_pct']:+.1f}%",
-                                 annotation_position="top right")
-                fig_mc.update_layout(title=f"Return Distribution ({mc['n_simulations']} runs)",
-                                     height=300, template="plotly_dark",
-                                     paper_bgcolor="#1e1e2e", plot_bgcolor="#1e1e2e",
-                                     xaxis_title="Return (%)", yaxis_title="Density",
-                                     margin=dict(t=40, b=10),
-                                     yaxis=dict(gridcolor="#313244"), xaxis=dict(gridcolor="#313244"))
-                st.plotly_chart(fig_mc, use_container_width=True)
-            with mc2:
-                pv = mc["p_value"]
-                st.metric("p-value", f"{pv:.3f}",
-                          "Skill likely ✓" if pv < 0.1 else "May be luck ✗",
-                          delta_color="normal" if pv < 0.1 else "inverse")
-                st.metric("Percentile", f"{mc['percentile']:.1f}th", "vs 1000 random runs")
-                st.metric("Actual Return", f"{mc['actual_return_pct']:+.1f}%")
-                st.metric("Avg Random",    f"{mc['mean_random_return']:+.1f}%")
-                (st.success if mc["passed"] else st.warning)(
-                    "Skill-driven (p < 0.10)" if mc["passed"] else "Cannot rule out luck")
-        else:
-            st.info("Not enough closed trades for Monte Carlo (need ≥ 2).")
-
-    # ── VALIDATION REPORT ─────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("✅ Strategy Validation Report")
-    bench_pass = (metrics.get("sharpe_ratio",0) >= 0.5 and
-                  metrics.get("win_rate_pct",0) >= 50 and
-                  metrics.get("alpha_pct",-999) >= 0)
-    wf_r = wf_results or st.session_state.get("wf_results")
-    if wf_r:
-        wp = sum(1 for r in wf_r if r.get("passed")); wt = len(wf_r)
-        wf_ok_r = wp >= max(1, wt*2//3); wf_det = f"{wp}/{wt} periods positive"
-    else:
-        wf_ok_r, wf_det = None, "Enable Walk-forward above"
-    mc_r = mc or st.session_state.get("mc")
-    if mc_r and mc_r.get("n_trades",0) >= 2:
-        mc_ok_r = mc_r.get("passed",False); mc_det = f"p-value = {mc_r.get('p_value',1):.3f}"
-    else:
-        mc_ok_r, mc_det = None, "Enable Monte Carlo above"
-    sw_r = st.session_state.get("sweep_df")
-    if sw_r is not None and not sw_r.empty:
-        br = sw_r.iloc[0]
-        sw_ok_r = True
-        sw_det = (f"Best: RSI {int(br['RSI_buy'])}/{int(br['RSI_sell'])}, "
-                  f"MA {int(br['MA_fast'])}/{int(br['MA_slow'])} (Sharpe={float(br['Sharpe']):.2f})")
-    else:
-        sw_ok_r, sw_det = None, "Enable Parameter Sweep above"
-
-    checks = [
-        ("Benchmark\nMetrics", bench_pass,
-         f"Sharpe {sharpe:.2f} · WinRate {win_rate:.0f}% · Alpha {alpha:+.1f}%"),
-        ("Parameter\nSweep",   sw_ok_r, sw_det),
-        ("Walk-forward\nTest", wf_ok_r, wf_det),
-        ("Monte Carlo",        mc_ok_r, mc_det),
-    ]
-    vc = st.columns(4)
-    for col, (label, passed, detail) in zip(vc, checks):
-        with col:
-            if passed is True:   st.success(f"✅ {label}")
-            elif passed is False: st.error(f"❌ {label}")
-            else:                 st.info(f"ℹ️ {label}")
-            st.caption(detail)
-
-    definite = [(p, l) for l, p, _ in checks if p is not None]
-    n_p = sum(1 for p, _ in definite if p); n_t = len(definite)
-    if n_t > 0:
-        ratio = n_p / n_t
-        if ratio == 1.0:   st.success("🏆 **STRATEGY CONFIDENCE: HIGH** — All checks passed")
-        elif ratio >= 0.5: st.warning(f"⚠️ **STRATEGY CONFIDENCE: MEDIUM** — {n_p}/{n_t} passed")
-        else:              st.error(f"🚨 **STRATEGY CONFIDENCE: LOW** — {n_p}/{n_t} passed")
-
-    # ── FOOTER ────────────────────────────────────────────────────────────────
-    st.divider()
-    f1, f2, f3 = st.columns(3)
-    sim_s = metrics.get("sim_start"); sim_e = metrics.get("sim_end")
-    f1.caption(f"📅 {pd.Timestamp(sim_s).strftime('%Y-%m-%d') if sim_s else '—'} → "
-               f"{pd.Timestamp(sim_e).strftime('%Y-%m-%d') if sim_e else '—'}")
-    f2.caption(f"📊 {len(df_raw)} trading days · {cfg.lookback_required}-day warmup")
-    f3.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            algo_counts = {}
+            for h in hist:
+                a = h.get("algorithm") or "—"
+                algo_counts[a] = algo_counts.get(a, 0) + 1
+            if algo_counts:
+                st.markdown("**Algorithm Trigger Count:**")
+                for a, cnt in sorted(algo_counts.items(), key=lambda x: -x[1]):
+                    st.markdown(f"- **{a}**: {cnt} ครั้ง")
