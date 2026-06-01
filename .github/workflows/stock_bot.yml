@@ -40,6 +40,12 @@ jobs:
       - name: 📦 Install dependencies
         run: pip install -r requirements.txt
 
+      - name: 🔍 Debug — ตรวจสอบ variables
+        run: |
+          echo "vars.WATCHLIST_STOCKS = '${{ vars.WATCHLIST_STOCKS }}'"
+          echo "inputs.symbols        = '${{ github.event.inputs.symbols }}'"
+          echo "resolved value        = '${{ github.event.inputs.symbols || vars.WATCHLIST_STOCKS }}'"
+
       - name: 📈 Run Stock Alert Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
