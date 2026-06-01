@@ -53,20 +53,14 @@ def build_watchlist(cli_symbols: list[str] | None = None) -> list[dict]:
 
     symbol ที่ไม่ระบุ cut_loss จะถูกคำนวณอัตโนมัติ (ATR×2)
     """
-    raw = os.environ.get("WATCHLIST_STOCKS", "")
-    print(f"  [DEBUG] cli_symbols     = {cli_symbols!r}")
-    print(f"  [DEBUG] WATCHLIST_STOCKS env = {raw!r}  (len={len(raw)})")
-
     if cli_symbols:
-        print("  [DEBUG] → path: CLI args")
         return [{"symbol": s.upper(), "name": "", "cut_loss": 0.0} for s in cli_symbols if s]
 
-    if raw.strip():
-        symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
-        print(f"  [DEBUG] → path: env var → {symbols}")
-        return [{"symbol": s, "name": "", "cut_loss": 0.0} for s in symbols]
+    raw = os.environ.get("WATCHLIST_STOCKS", "").strip()
+    if raw:
+        return [{"symbol": s.strip().upper(), "name": "", "cut_loss": 0.0}
+                for s in raw.split(",") if s.strip()]
 
-    print("  [DEBUG] → path: WATCHLIST_DEFAULT")
     return WATCHLIST_DEFAULT
 
 
