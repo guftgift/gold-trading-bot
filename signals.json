@@ -1,12 +1,12 @@
 {
   "last_signal": "HOLD",
-  "last_checked": "2026-06-04T06:29:30",
-  "last_price": 4496.2998046875,
-  "last_rsi": 44.028516823683574,
-  "last_ma_fast": 4565.199975585938,
-  "last_ma_slow": 4788.900981445313,
-  "last_ma_trend": 4393.529486083984,
-  "signal_reason": "RSI=44.0 → Neutral (อยู่ใน 35.0–65.0) | MA20 อยู่ใต้ MA100 — ยังไม่ข้าม",
+  "last_checked": "2026-06-04T08:43:30",
+  "last_price": 4491.0,
+  "last_rsi": 43.57142449318419,
+  "last_ma_fast": 4564.934985351562,
+  "last_ma_slow": 4788.8479833984375,
+  "last_ma_trend": 4393.502987060547,
+  "signal_reason": "RSI=43.6 → Neutral (อยู่ใน 35.0–65.0) | MA20 อยู่ใต้ MA100 — ยังไม่ข้าม",
   "algorithm_used": "—",
   "history": [
     {
@@ -305,7 +305,18 @@
       "ma_trend": 4393.53,
       "reason": "RSI=44.0 → Neutral (อยู่ใน 35.0–65.0) | MA20 อยู่ใต้ MA100 — ยังไม่ข้าม",
       "algorithm": "—"
+    },
+    {
+      "date": "2026-06-04T08:43:30",
+      "signal": "HOLD",
+      "price": 4491.0,
+      "rsi": 43.57,
+      "ma_fast": 4564.93,
+      "ma_slow": 4788.85,
+      "ma_trend": 4393.5,
+      "reason": "RSI=43.6 → Neutral (อยู่ใน 35.0–65.0) | MA20 อยู่ใต้ MA100 — ยังไม่ข้าม",
+      "algorithm": "—"
     }
   ],
-  "last_saved": "2026-06-04T06:29:30"
+  "last_saved": "2026-06-04T08:43:30"
 }
