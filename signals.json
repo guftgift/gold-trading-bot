@@ -1,12 +1,12 @@
 {
   "last_signal": "BUY",
-  "last_checked": "2026-06-10T16:37:46",
-  "last_price": 4153.0,
-  "last_rsi": 26.148570230545133,
-  "last_ma_fast": 4477.649975585938,
-  "last_ma_slow": 4775.1949853515625,
-  "last_ma_trend": 4412.016488037109,
-  "signal_reason": "RSI=26.1 → Oversold (ต่ำกว่า 35.0)",
+  "last_checked": "2026-06-11T06:42:13",
+  "last_price": 4108.39990234375,
+  "last_rsi": 24.714442362711324,
+  "last_ma_fast": 4445.944970703125,
+  "last_ma_slow": 4769.946987304687,
+  "last_ma_trend": 4415.46548828125,
+  "signal_reason": "RSI=24.7 → Oversold (ต่ำกว่า 35.0)",
   "algorithm_used": "RSI",
   "history": [
     {
@@ -525,7 +525,18 @@
       "ma_trend": 4412.02,
       "reason": "RSI=26.1 → Oversold (ต่ำกว่า 35.0)",
       "algorithm": "RSI"
+    },
+    {
+      "date": "2026-06-11T06:42:13",
+      "signal": "BUY",
+      "price": 4108.39990234375,
+      "rsi": 24.71,
+      "ma_fast": 4445.94,
+      "ma_slow": 4769.95,
+      "ma_trend": 4415.47,
+      "reason": "RSI=24.7 → Oversold (ต่ำกว่า 35.0)",
+      "algorithm": "RSI"
     }
   ],
-  "last_saved": "2026-06-10T16:37:48"
+  "last_saved": "2026-06-11T06:42:16"
 }
