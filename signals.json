@@ -1,13 +1,13 @@
 {
-  "last_signal": "BUY",
-  "last_checked": "2026-07-01T08:45:01",
-  "last_price": 3991.199951171875,
-  "last_rsi": 32.55540814367727,
-  "last_ma_fast": 4197.429992675781,
-  "last_ma_slow": 4666.032985839844,
-  "last_ma_trend": 4453.7399865722655,
-  "signal_reason": "RSI=32.6 → Oversold (ต่ำกว่า 35.0)",
-  "algorithm_used": "RSI",
+  "last_signal": "HOLD",
+  "last_checked": "2026-07-01T12:13:48",
+  "last_price": 4039.0,
+  "last_rsi": 35.29742335540212,
+  "last_ma_fast": 4199.819995117187,
+  "last_ma_slow": 4666.510986328125,
+  "last_ma_trend": 4453.978986816406,
+  "signal_reason": "RSI=35.3 → Neutral (อยู่ใน 35.0–65.0) | MA20 อยู่ใต้ MA100 — ยังไม่ข้าม",
+  "algorithm_used": "—",
   "history": [
     {
       "date": "2026-05-27T13:58:38",
@@ -1163,7 +1163,18 @@
       "ma_trend": 4453.74,
       "reason": "RSI=32.6 → Oversold (ต่ำกว่า 35.0)",
       "algorithm": "RSI"
+    },
+    {
+      "date": "2026-07-01T12:13:48",
+      "signal": "HOLD",
+      "price": 4039.0,
+      "rsi": 35.3,
+      "ma_fast": 4199.82,
+      "ma_slow": 4666.51,
+      "ma_trend": 4453.98,
+      "reason": "RSI=35.3 → Neutral (อยู่ใน 35.0–65.0) | MA20 อยู่ใต้ MA100 — ยังไม่ข้าม",
+      "algorithm": "—"
     }
   ],
-  "last_saved": "2026-07-01T08:45:03"
+  "last_saved": "2026-07-01T12:13:48"
 }
