@@ -12,9 +12,7 @@ name: 🥇 Gold Signal Monitor
 on:
   schedule:
     - cron: '0 2  * * 1-5'   # 09:00 ไทย
-    - cron: '0 5  * * 1-5'   # 12:00 ไทย
-    - cron: '0 9  * * 1-5'   # 16:00 ไทย
-    - cron: '0 13 * * 1-5'   # 20:00 ไทย
+
 
   # กดรันมือได้ใน GitHub Actions → Actions tab → Run workflow
   workflow_dispatch:
