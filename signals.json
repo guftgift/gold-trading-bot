@@ -1,12 +1,12 @@
 {
   "last_signal": "SELL",
-  "last_checked": "2026-08-20T02:49:36",
-  "last_price": 4549.89990234375,
-  "last_rsi": 70.51157093339611,
-  "last_ma_fast": 4229.894982910157,
-  "last_ma_slow": 4392.489995117187,
-  "last_ma_trend": 4493.18298828125,
-  "signal_reason": "RSI=70.5 → Overbought (สูงกว่า 65.0)",
+  "last_checked": "2026-08-21T02:55:20",
+  "last_price": 4594.7998046875,
+  "last_rsi": 72.41652667166551,
+  "last_ma_fast": 4254.279968261719,
+  "last_ma_slow": 4392.912993164063,
+  "last_ma_trend": 4495.943487548828,
+  "signal_reason": "RSI=72.4 → Overbought (สูงกว่า 65.0)",
   "algorithm_used": "RSI",
   "history": [
     {
@@ -2197,7 +2197,18 @@
       "ma_trend": 4493.18,
       "reason": "RSI=70.5 → Overbought (สูงกว่า 65.0)",
       "algorithm": "RSI"
+    },
+    {
+      "date": "2026-08-21T02:55:20",
+      "signal": "SELL",
+      "price": 4594.7998046875,
+      "rsi": 72.42,
+      "ma_fast": 4254.28,
+      "ma_slow": 4392.91,
+      "ma_trend": 4495.94,
+      "reason": "RSI=72.4 → Overbought (สูงกว่า 65.0)",
+      "algorithm": "RSI"
     }
   ],
-  "last_saved": "2026-08-20T02:49:38"
+  "last_saved": "2026-08-21T02:55:23"
 }
